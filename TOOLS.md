@@ -56,6 +56,7 @@ Fetches live character data from the PoE API.
 | Tool | Description |
 |------|-------------|
 | `get_character` | Fetch live gear and passive tree for the configured character |
+| `get_socketed_gems` | Exact socket layout + gem placement per equipped item from the PoE API (colours, links, which gem in each socket, empty sockets) — the authoritative binding PoB discards |
 | `get_character_pob` | Fetch character data and return a PoB-ready XML build |
 | `scan_stash_tabs` | Price all stash tabs whose name starts with `_` |
 | `kf_check` | Kinetic Fusillade breakpoint analysis via headless PoB (attack rate vs max effective APS) |

@@ -87,6 +87,33 @@ def _slot_name(inv_id: str) -> str:
     }.get(inv_id, inv_id)
 
 
+def _gem_summary(gem: dict) -> dict:
+    """Compact descriptor for a GGG-API socketedItem (skill/support gem or jewel).
+
+    Note: off-colour detection is intentionally NOT done here. The API's gem
+    `colour` field is ambiguous/unreliable (absent for some gems), so a gem's
+    natural colour must come from its attribute requirements via
+    pob-mcp's get_gem_detail — an authoritative downstream (playbook) step.
+    """
+    name = (gem.get("typeLine") or gem.get("name") or "").strip('"') or "?"
+    level, quality = None, "+0%"
+    for prop in gem.get("properties", []):
+        pname = prop.get("name")
+        vals = prop.get("values") or []
+        if not vals:
+            continue
+        if pname == "Level":
+            level = str(vals[0][0]).split()[0]      # "18" (drop any " (Max)")
+        elif pname == "Quality":
+            quality = str(vals[0][0])                # "+7%"
+    return {
+        "name": name,
+        "support": bool(gem.get("support")),
+        "level": level,
+        "quality": quality,
+    }
+
+
 # ── tool definitions ──────────────────────────────────────────────────────────
 
 TOOLS = [
@@ -107,6 +134,28 @@ TOOLS = [
                 "include_mods": {
                     "type": "boolean",
                     "description": "Include explicit/implicit mods on each item (default true).",
+                },
+            },
+        },
+    ),
+    Tool(
+        name="get_socketed_gems",
+        description=(
+            "Fetch the EXACT socket layout and gem placement for a character's equipped "
+            "items from the PoE API — the authoritative binding that Path of Building "
+            "discards on import. For each socketed item: the socket colours (R/G/B/W, "
+            "A=abyssal) and link groups, and which gem sits in each socket (level, "
+            "quality, support flag), plus empty sockets and their colours. Use for "
+            "gem-to-socket mapping, empty-socket colour, and socket-aware gear decisions. "
+            "(For off-colour detection, cross-reference each gem's natural colour from "
+            "its attribute requirements via pob-mcp's get_gem_detail.)"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "character_name": {
+                    "type": "string",
+                    "description": "Character name to fetch (default: from config.json).",
                 },
             },
         },
@@ -273,6 +322,67 @@ async def call_tool(name: str, arguments: dict):
                 },
             }
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+        # ── get_socketed_gems ──────────────────────────────────────────────
+        elif name == "get_socketed_gems":
+            character_name = arguments.get("character_name")
+            if character_name:
+                config = load_config()
+                api = PoeApi(config["poesessid"], config["account"], character_name)
+            else:
+                api = _api
+            items_data = api.get_items()
+
+            out_items = []
+            for item in items_data.get("items", []):
+                inv = item.get("inventoryId", "")
+                if inv in ("MainInventory", "Flask"):
+                    continue
+                sockets = item.get("sockets", [])
+                if not sockets:
+                    continue
+
+                gem_by_socket = {}
+                for g in item.get("socketedItems", []):
+                    si = g.get("socket")
+                    if si is not None:
+                        gem_by_socket[si] = _gem_summary(g)
+
+                socket_list = []
+                for idx, s in enumerate(sockets):
+                    color = s.get("sColour", "?")
+                    gem = gem_by_socket.get(idx)
+                    entry = {
+                        "index": idx,
+                        "color": color,
+                        "group": s.get("group", 0),
+                        "gem": gem["name"] if gem else None,
+                    }
+                    if gem:
+                        entry["support"] = gem["support"]
+                        if gem.get("level") is not None:
+                            entry["level"] = gem["level"]
+                        entry["quality"] = gem["quality"]
+                    socket_list.append(entry)
+
+                # Link groups, preserving socket order.
+                groups = {}
+                for s in sockets:
+                    groups.setdefault(s.get("group", 0), []).append(s.get("sColour", "?"))
+                layout = " ".join("-".join(v) for v in groups.values())
+
+                out_items.append({
+                    "slot": _slot_name(inv),
+                    "name": (item.get("name", "").strip('"') or item.get("typeLine", "")),
+                    "base": item.get("typeLine", ""),
+                    "layout": layout,
+                    "total_sockets": len(sockets),
+                    "max_link": max((len(v) for v in groups.values()), default=0),
+                    "empty_sockets": sum(1 for e in socket_list if e["gem"] is None),
+                    "sockets": socket_list,
+                })
+
+            return [TextContent(type="text", text=json.dumps({"items": out_items}, indent=2))]
 
         # ── get_character_pob ──────────────────────────────────────────────
         elif name == "get_character_pob":
