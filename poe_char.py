@@ -87,13 +87,19 @@ def _slot_name(inv_id: str) -> str:
     }.get(inv_id, inv_id)
 
 
+# GGG gem "colour" = the gem's natural attribute colour (S/D/I -> R/G/B). It is
+# ABSENT for white/colourless gems (no attribute requirement, e.g. Convocation,
+# Portal) and for jewels — which is exactly how we detect "fits any socket".
+_GEM_COLOR_MAP = {"S": "R", "D": "G", "I": "B"}
+
+
 def _gem_summary(gem: dict) -> dict:
     """Compact descriptor for a GGG-API socketedItem (skill/support gem or jewel).
 
-    Note: off-colour detection is intentionally NOT done here. The API's gem
-    `colour` field is ambiguous/unreliable (absent for some gems), so a gem's
-    natural colour must come from its attribute requirements via
-    pob-mcp's get_gem_detail — an authoritative downstream (playbook) step.
+    ``natural_color`` is the gem's own colour (R/G/B), or "W" when the API reports
+    no colour — i.e. a white/colourless gem that fits any socket. This is the
+    gem's NATURAL colour, not the socket it sits in (verified: a white gem in a
+    red socket returns no colour, so the field tracks the gem, not the socket).
     """
     name = (gem.get("typeLine") or gem.get("name") or "").strip('"') or "?"
     level, quality = None, "+0%"
@@ -111,6 +117,7 @@ def _gem_summary(gem: dict) -> dict:
         "support": bool(gem.get("support")),
         "level": level,
         "quality": quality,
+        "natural_color": _GEM_COLOR_MAP.get(gem.get("colour", ""), "W"),
     }
 
 
@@ -145,10 +152,11 @@ TOOLS = [
             "items from the PoE API — the authoritative binding that Path of Building "
             "discards on import. For each socketed item: the socket colours (R/G/B/W, "
             "A=abyssal) and link groups, and which gem sits in each socket (level, "
-            "quality, support flag), plus empty sockets and their colours. Use for "
-            "gem-to-socket mapping, empty-socket colour, and socket-aware gear decisions. "
-            "(For off-colour detection, cross-reference each gem's natural colour from "
-            "its attribute requirements via pob-mcp's get_gem_detail.)"
+            "quality, support flag, gem_color and off_color for gems in coloured "
+            "sockets), plus empty sockets and their colours. White/colourless gems "
+            "(gem_color 'W', e.g. Convocation) fit any socket and are never off-colour. "
+            "Use for gem-to-socket mapping, empty-socket colour, off-colour detection, "
+            "and socket-aware gear decisions."
         ),
         inputSchema={
             "type": "object",
@@ -363,6 +371,12 @@ async def call_tool(name: str, arguments: dict):
                         if gem.get("level") is not None:
                             entry["level"] = gem["level"]
                         entry["quality"] = gem["quality"]
+                        # Off-colour only applies to R/G/B sockets. A white gem
+                        # (natural_color "W") fits any socket; W/A sockets take anything.
+                        if color in ("R", "G", "B"):
+                            nat = gem["natural_color"]
+                            entry["gem_color"] = nat
+                            entry["off_color"] = nat not in (color, "W")
                     socket_list.append(entry)
 
                 # Link groups, preserving socket order.
@@ -379,6 +393,7 @@ async def call_tool(name: str, arguments: dict):
                     "total_sockets": len(sockets),
                     "max_link": max((len(v) for v in groups.values()), default=0),
                     "empty_sockets": sum(1 for e in socket_list if e["gem"] is None),
+                    "off_color_count": sum(1 for e in socket_list if e.get("off_color")),
                     "sockets": socket_list,
                 })
 
