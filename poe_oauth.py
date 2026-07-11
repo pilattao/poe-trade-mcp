@@ -11,7 +11,7 @@ Setup (one-time):
   2. Add POE_CLIENT_ID to your .mcp.json poe server env block
   3. Ask Claude to run the `poe_auth` tool — it opens your browser,
      you authorize, and tokens are saved automatically
-  4. Tokens are stored at ~/.cache/poe-mcp-server/tokens.json
+  4. Tokens are stored at ~/.cache/poe-trade-mcp/tokens.json
      and auto-refreshed before they expire
 
 GGG OAuth endpoints:
@@ -37,7 +37,7 @@ _AUTH_URL     = "https://www.pathofexile.com/oauth/authorize"
 _TOKEN_URL    = "https://www.pathofexile.com/oauth/token"
 _REDIRECT_URI = "http://localhost:7878/callback"
 _SCOPES       = "account:stashes account:characters account:profile"
-_TOKENS_PATH  = Path.home() / ".cache" / "poe-mcp-server" / "tokens.json"
+_TOKENS_PATH  = Path.home() / ".cache" / "poe-trade-mcp" / "tokens.json"
 _CALLBACK_TIMEOUT = 120  # seconds to wait for browser auth
 
 

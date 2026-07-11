@@ -1,6 +1,6 @@
 """Disk-based cache for PoE stash tab data.
 
-Cache lives at ~/.cache/poe-mcp-server/{league}/
+Cache lives at ~/.cache/poe-trade-mcp/{league}/
   tabs.json          — tab list (metadata), normalized from either API format
   tab_{index}.json   — items for each fetched tab
 
@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Iterable
 
-_CACHE_ROOT = Path.home() / ".cache" / "poe-mcp-server"
+_CACHE_ROOT = Path.home() / ".cache" / "poe-trade-mcp"
 _DEFAULT_TTL = 300  # seconds
 
 

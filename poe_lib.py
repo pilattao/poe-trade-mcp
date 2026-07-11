@@ -1,4 +1,4 @@
-"""PoE API client and shared utilities for poe-mcp-server.
+"""PoE API client and shared utilities for poe-trade-mcp.
 
 Authentication:
   Primary:  POESESSID cookie — works for character-window endpoints and
@@ -59,12 +59,12 @@ def load_config() -> dict:
     if not cfg.get("poesessid"):
         raise RuntimeError(
             "PoE session ID not found. Set POE_SESSION_ID env var "
-            "or add 'poesessid' to poe-mcp-server/config.json."
+            "or add 'poesessid' to poe-trade-mcp/config.json."
         )
     if not cfg.get("account"):
         raise RuntimeError(
             "PoE account name not found. Set POE_ACCOUNT_NAME env var "
-            "or add 'account' to poe-mcp-server/config.json."
+            "or add 'account' to poe-trade-mcp/config.json."
         )
 
     return cfg
@@ -88,7 +88,7 @@ class PoeApi:
         self.character = character
         self.client_id = client_id
         contact = f"; contact: {contact_email}" if contact_email else ""
-        self.user_agent = f"poe-mcp-server/1.0 (account: {self.account}{contact})"
+        self.user_agent = f"poe-trade-mcp/1.0 (account: {self.account}{contact})"
 
     def _rate_limit(self):
         elapsed = time.monotonic() - PoeApi._last_request_time

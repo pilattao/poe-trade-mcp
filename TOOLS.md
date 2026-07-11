@@ -1,4 +1,4 @@
-# poe-mcp-server — Tool Reference
+# poe-trade-mcp — Tool Reference
 
 Multi-server MCP bundle for Path of Exile. All tools are prefixed `mcp__poe__` in the Claude context.
 Entry point: `poe_all.py`.

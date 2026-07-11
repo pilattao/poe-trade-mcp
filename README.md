@@ -1,4 +1,4 @@
-# poe-mcp-server
+# poe-trade-mcp
 
 > **This product is not affiliated with or endorsed by Grinding Gear Games in any way.**
 
@@ -39,7 +39,7 @@ The repo contains 7 Python modules. Six are standalone MCP servers, each with th
 | `poe_filter` | poe-filter | 8487 |
 | `pob_vault_mcp` | pob-vault | (external) |
 | `server` (pob-brain) | pob-brain | (external) |
-| **poe_all** | **poe-all** | **8490** |
+| **poe_all** | **poe-trade-mcp** | **8490** |
 
 ---
 
@@ -488,7 +488,7 @@ These modules live directly in this repo:
 | Module | Purpose |
 |--------|---------|
 | `poe_lib.py` | `PoeApi` HTTP client for the PoE character-window API (POESESSID cookie auth), `load_config()` reading credentials from `POE_SESSION_ID` / `POE_ACCOUNT_NAME` env vars or `config.json`. `build_pob_xml` and `PobAnalyzer` are stubs — use pob-mcp's `lua_import_character` instead. |
-| `stash_cache.py` | `StashCache` class — 5-minute disk cache at `~/.cache/poe-mcp-server/{league}/` for stash tab data. |
+| `stash_cache.py` | `StashCache` class — 5-minute disk cache at `~/.cache/poe-trade-mcp/{league}/` for stash tab data. |
 | `rare_scorer.py` | `score_item()`, `score_item_text()`, `classify_item()` — mod triage scorer. Scores items by matching PoE API mod text strings against weighted rules for life, resistances, crit, speed, and damage. Does not produce price estimates; use the trade API for those. |
 
 ### Price Database
@@ -557,9 +557,9 @@ Add to your `.mcp.json` (or Claude Desktop config) as a single entry using the c
 ```json
 {
     "mcpServers": {
-        "poe-all": {
+        "poe-trade-mcp": {
             "command": "python",
-            "args": ["/path/to/poe-mcp-server/poe_all.py"],
+            "args": ["/path/to/poe-trade-mcp/poe_all.py"],
             "env": {
                 "POE_FILTER_PATH": "/path/to/Your.filter",
                 "POE_CONFIG_PATH": "/path/to/poe_monitor/config.json"
@@ -576,27 +576,27 @@ Or register individual servers separately:
     "mcpServers": {
         "poe-market": {
             "command": "python",
-            "args": ["/path/to/poe-mcp-server/poe_market.py"]
+            "args": ["/path/to/poe-trade-mcp/poe_market.py"]
         },
         "poe-stash": {
             "command": "python",
-            "args": ["/path/to/poe-mcp-server/poe_stash.py"]
+            "args": ["/path/to/poe-trade-mcp/poe_stash.py"]
         },
         "poe-trade": {
             "command": "python",
-            "args": ["/path/to/poe-mcp-server/poe_trade.py"]
+            "args": ["/path/to/poe-trade-mcp/poe_trade.py"]
         },
         "poe-char": {
             "command": "python",
-            "args": ["/path/to/poe-mcp-server/poe_char.py"]
+            "args": ["/path/to/poe-trade-mcp/poe_char.py"]
         },
         "poe-pricer": {
             "command": "python",
-            "args": ["/path/to/poe-mcp-server/poe_pricer.py"]
+            "args": ["/path/to/poe-trade-mcp/poe_pricer.py"]
         },
         "poe-filter": {
             "command": "python",
-            "args": ["/path/to/poe-mcp-server/poe_filter.py"]
+            "args": ["/path/to/poe-trade-mcp/poe_filter.py"]
         }
     }
 }

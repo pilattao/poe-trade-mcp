@@ -41,7 +41,7 @@ _api   = None
 _league = None
 _last_sessid = None
 
-PRICE_DB = Path.home() / ".cache" / "poe-mcp-server" / "price_history.db"
+PRICE_DB = Path.home() / ".cache" / "poe-trade-mcp" / "price_history.db"
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

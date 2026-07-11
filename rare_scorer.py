@@ -1,4 +1,4 @@
-"""Rare item triage scorer for poe-mcp-server.
+"""Rare item triage scorer for poe-trade-mcp.
 
 Scores rare items by identifying and weighting valuable mods from the PoE API
 item format. Does NOT produce price estimates — use the trade API for that.

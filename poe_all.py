@@ -1,4 +1,4 @@
-"""poe-all MCP Server — single server that bundles all PoE MCP tools.
+"""poe-trade-mcp MCP Server — single server that bundles all PoE MCP tools.
 
 Runs all poe-market, poe-stash, poe-trade, poe-char, poe-pricer, poe-filter,
 pob-vault, and pob-brain tools under one MCP connection.
@@ -27,7 +27,7 @@ import json
 from mcp.server import Server
 from mcp.types import TextContent, Tool
 
-combined = Server("poe-all")
+combined = Server("poe-trade-mcp")
 
 # ── Sub-server registry ───────────────────────────────────────────────────────
 # (module_path, prefix, port_for_reference)
@@ -50,7 +50,7 @@ def _load_servers():
         try:
             mod = importlib.import_module(module_name)
         except Exception as e:
-            print(f"[poe-all] WARNING: could not load {module_name}: {e}", file=sys.stderr)
+            print(f"[poe-trade-mcp] WARNING: could not load {module_name}: {e}", file=sys.stderr)
             continue
 
         # Each server registers handlers via @app.list_tools() and @app.call_tool()
@@ -58,7 +58,7 @@ def _load_servers():
         sub_app = getattr(mod, "app", None)
         tools = getattr(mod, "TOOLS", [])
         if not sub_app or not tools:
-            print(f"[poe-all] WARNING: {module_name} has no app or TOOLS", file=sys.stderr)
+            print(f"[poe-trade-mcp] WARNING: {module_name} has no app or TOOLS", file=sys.stderr)
             continue
 
         # Get the call_tool handler registered on the sub-server
@@ -68,7 +68,7 @@ def _load_servers():
         for tool in tools:
             _tool_registry[tool.name] = (handler, tool.name, prefix)
 
-        print(f"[poe-all] loaded {len(tools)} tools from {module_name}", file=sys.stderr)
+        print(f"[poe-trade-mcp] loaded {len(tools)} tools from {module_name}", file=sys.stderr)
 
     # pob-brain is special (has LuaProcess), load separately
     try:
@@ -79,9 +79,9 @@ def _load_servers():
         handler = sub_app.request_handlers.get(CallToolRequest)
         for tool in tools:
             _tool_registry[tool.name] = (handler, tool.name, "pob-brain")
-        print(f"[poe-all] loaded {len(tools)} tools from pob-brain", file=sys.stderr)
+        print(f"[poe-trade-mcp] loaded {len(tools)} tools from pob-brain", file=sys.stderr)
     except Exception as e:
-        print(f"[poe-all] WARNING: could not load pob-brain: {e}", file=sys.stderr)
+        print(f"[poe-trade-mcp] WARNING: could not load pob-brain: {e}", file=sys.stderr)
 
 
 _load_servers()
@@ -146,5 +146,5 @@ async def call_tool(name: str, arguments: dict):
 from mcp_server_utils import run_server
 
 if __name__ == "__main__":
-    print(f"[poe-all] {len(_ALL_TOOLS)} tools loaded across {len(_SERVERS) + 1} servers", file=sys.stderr)
-    run_server(combined, port=8490, name="poe-all")
+    print(f"[poe-trade-mcp] {len(_ALL_TOOLS)} tools loaded across {len(_SERVERS) + 1} servers", file=sys.stderr)
+    run_server(combined, port=8490, name="poe-trade-mcp")

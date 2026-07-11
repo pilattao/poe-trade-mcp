@@ -250,7 +250,7 @@ async def call_tool(name: str, arguments: dict):
                     ".mcp.json poe server env block and restart MCP servers."
                 ))]
             _init()
-            tokens = run_auth_flow(client_id, _api.user_agent if _api else "poe-mcp-server/1.0")
+            tokens = run_auth_flow(client_id, _api.user_agent if _api else "poe-trade-mcp/1.0")
             mins = int(tokens.get("expires_in", 3600)) // 60
             return [TextContent(type="text", text=(
                 f"OAuth authorization successful! Token expires in {mins} minutes. "
