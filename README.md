@@ -3,6 +3,9 @@
 A standalone MCP stdio server for **public PoE2 trade metadata/search, poe.ninja
 prices, local price history, public character snapshots, and local filter files**.
 This is the trade submodule of the suite; it does not import sibling PoB servers.
+An optional official PoE2 OAuth character client is now available after explicit
+configuration and user consent. Public ninja remains the default; see
+[OAuth setup, contract and live-check requirements](OAUTH_REPORT.md).
 
 ## Install and run
 
@@ -22,7 +25,7 @@ this submodule does not install into or reconfigure a running suite.
 
 `poe_all.py` loads all six owned servers as one registry. Missing imports,
 invalid schemas, and duplicate tool names fail startup with the module named.
-All 39 declared tools are discoverable. Eight retained compatibility tools return
+All 40 declared tools are discoverable. Seven retained compatibility tools return
 explicit unsupported errors; they are documented below. Sibling `pob_vault_mcp`
 and `server` modules are intentionally not part of this registry: launch those
 through their own suite configuration.
@@ -37,10 +40,11 @@ through their own suite configuration.
 | `POE_ACCOUNT_NAME`, `POE_CHARACTER_NAME`, `POE_NINJA_LEAGUE_SLUG` | Optional defaults for public character URLs. Prefer an explicit `profile_url`. |
 | `POE2_CHROME_PATH` | Optional existing Chromium/Chrome executable for character snapshots. |
 
-There is no session-cookie or OAuth configuration in this port. It never reads
-`config.json`, session tokens, browser login profiles, or sibling credentials.
-The historical `poe_oauth.py`, `stash_cache.py`, and `rare_scorer.py` files are
-retained as inactive source; owned MCP tools do not call them.
+Public tools never read `config.json`, session cookies, browser login profiles,
+or sibling credentials. OAuth uses only explicitly configured `POE_OAUTH_*`
+inputs and a component-owned private store; there is no global token default.
+The historical OAuth source is preserved as `legacy/poe_oauth.py.txt`.
+`stash_cache.py` and `rare_scorer.py` remain inactive reference source.
 
 ## Trade
 
@@ -164,8 +168,8 @@ profile-fetch cooldown limits uncached requests. No private data is published.
 ## Remaining work after this bounded slice
 
 - `list_tabs`, `get_tab`, `price_tab`, `find_items`, `cache_status`,
-  `poe_auth` and `scan_stash_tabs` are not implemented in this
-  public-only port. GGG's [reference](https://www.pathofexile.com/developer/docs/reference)
+  and `scan_stash_tabs` are not implemented in this
+  slice. GGG's [reference](https://www.pathofexile.com/developer/docs/reference)
   labels account/guild/public stashes PoE1-only; official character access needs
   OAuth. No credentials are requested or harvested.
 - `score_rare` works locally: it extracts PoE2 clipboard mods, identifies
@@ -173,10 +177,12 @@ profile-fetch cooldown limits uncached requests. No private data is published.
   preserves unknown text, and returns a null price. It does not call a source
   or pretend that arbitrary mod weights are market prices.
 - `poe_auth_status` reports the audited OAuth capability and implementation
-  state, **not token validity**. Token status is `not_inspected`. Official
+  state, **not remote token validity**. Without an explicit owned store, token
+  status is `not_inspected`; with one, only local expiry/scope/state is inspected. Official
   `GET https://api.pathofexile.com/character/poe2` and
   `GET https://api.pathofexile.com/character/poe2/{name}` support PoE2 with
-  `account:characters`; implementation and authenticated verification remain.
+  `account:characters`. The client and opt-in PKCE flow are implemented with
+  offline contracts; authenticated live verification remains. See OAUTH_REPORT.md.
 - `kf_check` returns an unsupported error: its inherited PoE1 breakpoint model
   has no verified PoE2 basis.
 - Exact baseline copies of replaced character/stash/library modules are in

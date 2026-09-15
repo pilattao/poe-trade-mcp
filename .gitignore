@@ -8,3 +8,8 @@ config.json
 .cache/
 *.sqlite3
 *.sqlite3-*
+
+# Explicit OAuth credential stores and atomic staging files
+poe2-oauth.json
+poe2-oauth.lock
+.poe2-oauth-*

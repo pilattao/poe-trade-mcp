@@ -5,3 +5,7 @@ These `.py.txt` files are exact copies of the replaced modules at baseline
 registered or imported by the PoE2 server. `poe_oauth.py`, `stash_cache.py`, and
 `rare_scorer.py` remain unchanged at the root. Read PORT_REPORT.md before
 reviving a capability: original endpoint/scoring assumptions need an audit.
+
+`poe_oauth.py.txt` separately preserves the previous OAuth implementation from
+checkpoint `c950576`; it used a global token path and is reference-only. The new
+explicit public-client component is described in ../OAUTH_REPORT.md.

@@ -322,7 +322,6 @@ def test_legacy_private_capabilities_are_explicit_without_config_reads(monkeypat
     for name in (
         "list_tabs",
         "get_tab",
-        "poe_auth",
         "price_tab",
         "find_items",
         "cache_status",

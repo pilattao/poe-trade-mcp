@@ -1,9 +1,11 @@
 """Explicit compatibility responses for unsupported private PoE2 stash tools.
 
 GGG documents account/guild/public stashes as PoE1-only. This server performs
-no credential discovery, authorization flow or private reads. Clipboard analysis is local.
+no credential discovery. OAuth character authorization is an explicit opt-in; stash
+access remains outside the documented PoE2 API. Clipboard analysis is local.
 """
 
+import anyio
 from mcp.types import Tool
 from mcp_server_utils import Server, result, run_server
 from rare_analysis import analyze_clipboard
@@ -13,27 +15,30 @@ app = Server("poe-stash")
 TOOLS = [
     Tool(
         name="poe_auth",
-        description=(
-            "Run the OAuth 2.1 authorization flow for the PoE API. "
-            "Optional upgrade from POESESSID — required for the newer official stash API. "
-            "Opens a browser window for you to authorize, then saves tokens automatically. "
-            "Requires POE_CLIENT_ID env var (register at pathofexile.com/developer). "
-            "Once authorized, stash tools automatically use OAuth for better reliability."
-        ),
+        description="Default: local OAuth status/configuration requirements. action=authorize starts the registered-public-client PKCE flow only with confirm=true and POE_OAUTH_ENABLED=1. Never supply tokens in tool arguments.",
         inputSchema={
             "type": "object",
             "properties": {
-                "client_id": {
+                "action": {
                     "type": "string",
-                    "description": "Your PoE developer app client_id. Overrides POE_CLIENT_ID env var.",
+                    "enum": ["status", "authorize"],
+                    "default": "status",
+                },
+                "confirm": {"type": "boolean", "default": False},
+                "timeout": {
+                    "type": "integer",
+                    "minimum": 10,
+                    "maximum": 180,
+                    "default": 120,
                 },
             },
+            "additionalProperties": False,
         },
     ),
     Tool(
         name="poe_auth_status",
-        description="Check the status of the current OAuth token (valid, expired, or not set up).",
-        inputSchema={"type": "object", "properties": {}},
+        description="Inspect only the explicitly configured owned OAuth store. Report local expiry/scope/state without token values, refresh, introspection, or any network request.",
+        inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
     ),
     Tool(
         name="get_tab",
@@ -141,9 +146,7 @@ TOOLS = [
 for tool in TOOLS:
     if tool.name == "score_rare":
         tool.description = "Analyze supplied PoE2 Rare/Magic clipboard mods locally and suggest comparison criteria; no calibrated price or network request."
-    elif tool.name == "poe_auth_status":
-        tool.description = "Report audited official PoE2 OAuth capability and this port status without reading tokens or making requests."
-    else:
+    elif tool.name not in ("poe_auth", "poe_auth_status"):
         tool.description = "Not implemented in this bounded PoE2 port; see PORT_REPORT.md for preserved originals and exact API evidence."
 
 
@@ -156,24 +159,21 @@ async def list_tools():
 async def call_tool(name, arguments):
     if name == "score_rare":
         return result(analyze_clipboard(arguments["item_text"]))
-    if name == "poe_auth_status":
+    if name in ("poe_auth", "poe_auth_status"):
+        from poe_oauth import token_status, run_auth_flow
+
+        if name == "poe_auth_status" or arguments.get("action", "status") == "status":
+            return result(await anyio.to_thread.run_sync(token_status))
+        from functools import partial
+
         return result(
-            {
-                "official_poe2_character_api": True,
-                "character_url_template": "https://api.pathofexile.com/character/poe2/{name}",
-                "list_characters_url": "https://api.pathofexile.com/character/poe2",
-                "required_scope": "account:characters",
-                "oauth_flow_in_this_port": "not_implemented",
-                "token_status": "not_inspected",
-                "official_poe2_stash_api_documented": False,
-                "evidence": "https://www.pathofexile.com/developer/docs/reference#characters",
-                "authorization_docs": "https://www.pathofexile.com/developer/docs/authorization",
-                "note": "PoE2 OAuth character access is documented. No token presence, validity, scopes or endpoint access has been tested. Stash sections are labeled PoE1-only.",
-            }
-        )
-    if name == "poe_auth":
-        raise NotImplementedError(
-            "PoE2 OAuth character access exists (account:characters; /character/poe2), but this bounded port has not implemented/validated the authorization flow. See preserved originals and PORT_REPORT.md; no credentials are required for public snapshots."
+            await anyio.to_thread.run_sync(
+                partial(
+                    run_auth_flow,
+                    confirm=arguments.get("confirm", False),
+                    timeout=arguments.get("timeout", 120),
+                )
+            )
         )
     raise NotImplementedError(
         "Unavailable in this bounded port: GGG account/guild/public stash APIs are documented as PoE1-only. This does not mean PoE2 OAuth character access is unavailable. See PORT_REPORT.md."

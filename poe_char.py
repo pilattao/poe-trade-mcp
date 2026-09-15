@@ -1,4 +1,4 @@
-"""Public PoE2 character snapshots from the visible poe.ninja PoB2 export."""
+"""Public ninja snapshots by default; explicit opt-in official OAuth reads."""
 
 import urllib.parse
 import anyio
@@ -61,6 +61,29 @@ TOOLS = [
 ]
 
 
+# Only get_character can switch sources. PoB exports and skill-group reads keep
+# their established public-source contract; official JSON is not fabricated XML.
+TOOLS[0].inputSchema["properties"] = {
+    **PROFILE,
+    "source": {"type": "string", "enum": ["public", "oauth"], "default": "public"},
+    "confirm_oauth": {"type": "boolean", "default": False},
+}
+TOOLS[
+    0
+].description += " source=oauth instead returns official character JSON, only with explicit confirm_oauth and configured enablement."
+TOOLS.append(
+    Tool(
+        name="list_oauth_characters",
+        description="Explicit private read of the authorized account's PoE2 character list. Requires confirm_oauth=true and POE_OAUTH_ENABLED=1. No private response is saved.",
+        inputSchema={
+            "type": "object",
+            "properties": {"confirm_oauth": {"type": "boolean", "default": False}},
+            "additionalProperties": False,
+        },
+    )
+)
+
+
 def _profile_url(args):
     cfg = load_config()
     if args.get("profile_url"):
@@ -96,6 +119,22 @@ async def list_tools():
 async def call_tool(name, args):
     if name in ("scan_stash_tabs", "kf_check"):
         raise NotImplementedError(next(t.description for t in TOOLS if t.name == name))
+    if name == "list_oauth_characters" or args.get("source") == "oauth":
+        from functools import partial
+        from poe_oauth import OAuthConfig
+        from poe_oauth_client import CharacterClient
+
+        config = OAuthConfig.from_env()
+        config.require_action(args.get("confirm_oauth", False))
+        if any(key in args for key in ("profile_url", "account", "league_slug")):
+            raise ValueError("Public profile fields cannot select the OAuth account")
+        client = CharacterClient(config)
+        operation = (
+            partial(client.list_characters, confirm=True)
+            if name == "list_oauth_characters"
+            else partial(client.get_character, args.get("character_name"), confirm=True)
+        )
+        return result(await anyio.to_thread.run_sync(operation))
     data = await anyio.to_thread.run_sync(get_snapshot, _profile_url(args))
     if name == "get_socketed_gems":
         return result({"skills": data["skills"], "source": data["source"]})

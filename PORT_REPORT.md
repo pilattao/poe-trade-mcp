@@ -1,4 +1,7 @@
-# Bounded PoE2 trade submodule port — handoff
+# Bounded PoE2 trade submodule port — historical checkpoint handoff
+
+OAuth follow-up: [OAUTH_REPORT.md](OAUTH_REPORT.md) supersedes the OAuth gaps
+below. The original slice and its test results are retained as history.
 
 Date: 2026-09-15. All changes are directly in this submodule; no commits,
 pushes, sibling edits, shared environment changes, or live-runtime changes.
