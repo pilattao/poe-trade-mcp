@@ -1,603 +1,207 @@
-# poe-trade-mcp
+# PoE2 trade MCP
 
-> **This product is not affiliated with or endorsed by Grinding Gear Games in any way.**
+A standalone MCP stdio server for **public PoE2 trade metadata/search, poe.ninja
+prices, local price history, public character snapshots, and local filter files**.
+This is the trade submodule of the suite; it does not import sibling PoB servers.
 
-[![Follow on X](https://img.shields.io/badge/follow-%40boschzilla-black.svg?logo=x)](https://x.com/boschzilla)
+## Install and run
 
-A collection of MCP (Model Context Protocol) servers that expose Path of Exile game data, pricing, trade, stash management, character inspection, item filtering, and market analytics as tool-callable endpoints. Designed to be used by AI assistants (Claude, etc.) for PoE build planning, economy tracking, and in-game automation.
+Python 3.10+ and the supported upstream MCP 1.x API are required:
 
----
-
-## Part of poe_mcp_suite
-
-This server is part of [poe_mcp_suite](https://github.com/charleslucas/poe_mcp_suite) — a collection of MCP servers for Path of Exile designed to work together with Claude. See the suite repo for an overview of all available servers and tools.
-
----
-
-## Architecture
-
-The repo contains 7 Python modules. Six are standalone MCP servers, each with their own `Server` instance, `TOOLS` list, and `call_tool` handler. The seventh, `poe_all.py`, acts as a **unified gateway** that dynamically imports all six sibling servers (plus the external `pob-vault` and `pob-brain` servers), collects their tool definitions, and re-registers everything onto a single combined MCP `Server`. This means you can either run individual servers on their own ports, or run `poe_all.py` once to get every tool under one MCP connection.
-
-### How poe_all.py bundles sub-servers
-
-1. Adds sibling directories (`c:/src/pobrain`, `c:/src/buildstuff`) to `sys.path`.
-2. Iterates a registry of `(module_name, prefix)` tuples and uses `importlib.import_module()` to load each.
-3. From each loaded module, reads the `TOOLS` list and extracts the `call_tool` request handler from the sub-server's `app.request_handlers`.
-4. Stores a mapping of `tool_name -> (handler, original_name, prefix)` in `_tool_registry`.
-5. The combined `@combined.call_tool()` handler dispatches incoming calls by constructing a synthetic `CallToolRequest` and forwarding it to the appropriate sub-server handler.
-6. `pob-brain` (from `c:/src/pobrain/server.py`) is loaded separately because it manages a LuaProcess for headless Path of Building.
-
-**Sub-server registry:**
-
-| Module | Prefix | Standalone Port |
-|--------|--------|-----------------|
-| `poe_market` | poe-market | 8481 |
-| `poe_stash` | poe-stash | 8482 |
-| `poe_trade` | poe-trade | 8483 |
-| `poe_char` | poe-char | 8485 |
-| `poe_pricer` | poe-pricer | 8486 |
-| `poe_filter` | poe-filter | 8487 |
-| `pob_vault_mcp` | pob-vault | (external) |
-| `server` (pob-brain) | pob-brain | (external) |
-| **poe_all** | **poe-trade-mcp** | **8490** |
-
----
-
-## Modules
-
-### poe_all.py
-
-**What it does:** Unified MCP server that bundles all PoE and PoB tools into a single endpoint. No tools of its own -- it re-exports everything from the sub-servers.
-
-**Entry point:**
-```
-python poe_all.py          # stdio mode (for .mcp.json)
-python poe_all.py sse      # HTTPS SSE on port 8490
+```sh
+python -m pip install -r requirements.txt
+python poe_all.py
 ```
 
----
-
-### poe_char.py
-
-**What it does:** Live character data from the PoE API -- equipped gear, passive tree, PoB XML export, and Kinetic Fusillade breakpoint analysis.
-
-#### Tools
-
-| Tool | Description |
-|------|-------------|
-| **`get_character`** | Fetch equipped items and passive tree for a character. |
-| **`get_character_pob`** | Fetch character data and return a complete Path of Building XML. |
-| **`scan_stash_tabs`** | Price all stash tabs whose name starts with `_`. Rares scored via algorithm, uniques via poe.ninja DB. |
-| **`kf_check`** | Kinetic Fusillade breakpoint analysis via headless PoB. |
-
-#### get_character
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `character_name` | string | config default | Character name to fetch |
-| `include_mods` | boolean | true | Include implicit/explicit/crafted mods on each item |
-
-**Returns:** JSON with `character` (name, class, level, league), `gear` (keyed by slot with name, base, ilvl, rarity, mods), and `passives` (node_count, mastery_count, node hashes, mastery effects).
-
-#### get_character_pob
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `character_name` | string | config default | Character name to fetch |
-
-**Returns:** Complete PoB XML string. Use with `load_build(xml=...)` on pob-brain.
-
-#### scan_stash_tabs
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `min_price` | integer | 5 | Minimum chaos value to include |
-| `force` | boolean | true | Bypass stash cache and fetch fresh from API |
-
-**Returns:** JSON with `scanned_tabs`, `total_rares`, `total_uniques`, `rare_hits` (with name, slot, price, score, breakdown), `unique_hits` (with name, base, price), and `errors`.
-
-#### kf_check
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| (none) | | | Uses configured character |
-
-**Returns:** JSON with `status` (SAFE/TIGHT/JAMMED), `attack_rate_aps`, `max_effective_aps`, `headroom_aps`, `headroom_pct`, `skill_duration_s`, `reduced_duration_pct`, `projectile_count`, `full_dps`, `has_less_duration`, `has_window_of_opportunity`, and `recommendations` array.
-
-**Notable:** Runs a Lua script inside headless PoB to extract KF-specific stats from `build.calcsTab.mainOutput`. Checks gem links for Less Duration Support and passive tree for Window of Opportunity.
-
----
-
-### poe_filter.py
-
-**What it does:** Read and edit PoE `.filter` files programmatically. Supports full PoE item filter syntax (Show/Hide/Continue blocks). Designed for NeverSink-style filters with comment metadata and `[[xxxx]]` section headers.
-
-**Default filter path:** `~/Documents/My Games/Path of Exile/Starting.filter` — override with `POE_FILTER_PATH` env var
-
-#### Tools
-
-| Tool | Description |
-|------|-------------|
-| **`get_filter_info`** | Summary of filter: path, line count, block counts by type, section headers. |
-| **`find_blocks`** | Search blocks by text (case-insensitive full-text match). |
-| **`get_block`** | Get the full text of a block by its starting line number. |
-| **`add_block`** | Insert a new block at a position (top/bottom/after_line:N/after_pattern:TEXT). |
-| **`remove_block`** | Remove a block by its starting line number. |
-| **`replace_block`** | Replace a block entirely with new text. |
-| **`set_basetype_rule`** | Convenience: add a top-priority Show/Hide rule for specific BaseTypes. |
-
-#### get_filter_info
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `filter_path` | string | DEFAULT_FILTER | Path to .filter file |
-
-**Returns:** JSON with `path`, `total_lines`, `blocks` (counts by Show/Hide/Continue/total), `sections` (first 40 `[[xxxx]]` section headers with line numbers).
-
-#### find_blocks
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `query` | string | *required* | Text to search for |
-| `filter_path` | string | DEFAULT_FILTER | Path to .filter file |
-| `limit` | integer | 20 | Max results |
-
-**Returns:** JSON with `total_matches` and `blocks` array (line, end_line, type, comment, conditions, preview).
-
-#### get_block
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `line` | integer | *required* | Starting line number (1-based) |
-| `filter_path` | string | DEFAULT_FILTER | Path to .filter file |
-
-**Returns:** JSON with `line`, `end_line`, `text`.
-
-#### add_block
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `block_text` | string | *required* | Full block text to insert |
-| `position` | string | "top" | Where to insert: `top`, `bottom`, `after_line:N`, `after_pattern:TEXT` |
-| `filter_path` | string | DEFAULT_FILTER | Path to .filter file |
-
-**Returns:** JSON with `ok`, `inserted_after_line`, `new_block`.
-
-**Notable:** Validates blocks before insertion -- rejects empty blocks, blocks without conditions (would match ALL items), and blocks with literal `\n`/`\t` escape sequences instead of real whitespace.
-
-#### remove_block
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `line` | integer | *required* | Starting line number (1-based) |
-| `filter_path` | string | DEFAULT_FILTER | Path to .filter file |
-
-**Returns:** JSON with `ok`, `removed_lines`, `removed_text`.
-
-#### replace_block
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `line` | integer | *required* | Starting line number (1-based) |
-| `new_block_text` | string | *required* | Replacement block text |
-| `filter_path` | string | DEFAULT_FILTER | Path to .filter file |
-
-**Returns:** JSON with `ok`, `replaced_lines`, `old`, `new`.
-
-#### set_basetype_rule
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `action` | string | *required* | "Show" or "Hide" |
-| `basetypes` | array[string] | *required* | List of BaseType strings |
-| `exact_match` | boolean | true | Use `==` exact match operator |
-| `comment` | string | auto-generated | Comment on block header |
-| `extra_conditions` | string | "" | Additional condition lines |
-| `filter_path` | string | DEFAULT_FILTER | Path to .filter file |
-
-**Returns:** Same as `add_block` or `replace_block` (replaces existing Bosch overrides for the same basetypes).
-
-**Notable:** Inserts into the `[[0100]]` override section for highest priority. If a "Bosch" tagged override already exists for the same basetype, it replaces it instead of duplicating.
-
----
-
-### poe_market.py
-
-**What it does:** Exposes the local `price_history.db` SQLite database (populated by an external `trend_watcher.py` process that scrapes poe.ninja) via MCP. Provides price lookups, history, trend analysis (risers/fallers/movers), and database status.
-
-#### Tools
-
-| Tool | Description |
-|------|-------------|
-| **`get_price`** | Get the latest price for a specific item (exact match, case-insensitive). |
-| **`get_price_history`** | Get all price snapshots for an item over time. |
-| **`search_items`** | Search items by name substring. |
-| **`get_risers`** | Items with the biggest positive price increase (% change). |
-| **`get_fallers`** | Items with the biggest negative price drop (% change). |
-| **`get_movers`** | Items with the biggest absolute price movement (volatile items). |
-| **`snapshot_status`** | Database info: total snapshots, latest/oldest fetch time, items tracked. |
-
-#### get_price
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `name` | string | *required* | Item name (exact match, case-insensitive) |
-
-**Returns:** JSON with `name`, `chaos_value`, `category`, and other fields from `price_db.search_items()`.
-
-#### get_price_history
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `name` | string | *required* | Item name (exact match, falls back to fuzzy) |
-
-**Returns:** Array of price snapshot records over time.
-
-#### search_items
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `query` | string | *required* | Search term (substring match) |
-| `limit` | integer | 20 | Max results |
-
-**Returns:** Array of items with latest prices.
-
-#### get_risers
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `min_snapshots` | integer | 3 | Minimum price snapshots required for reliable trends |
-| `limit` | integer | 25 | Max results |
-| `min_price` | number | 0 | Minimum current chaos price (filters out junk) |
-
-**Returns:** Array of items sorted by % price increase.
-
-#### get_fallers
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `min_snapshots` | integer | 3 | Minimum snapshots required |
-| `limit` | integer | 25 | Max results |
-
-**Returns:** Array of items sorted by % price decrease.
-
-#### get_movers
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `min_snapshots` | integer | 3 | Minimum snapshots required |
-| `limit` | integer | 25 | Max results |
-
-**Returns:** Array of items sorted by absolute price movement.
-
-#### snapshot_status
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| (none) | | | |
-
-**Returns:** JSON with `total_snapshots`, `latest_fetch`, `oldest_fetch`, `items_tracked`.
-
----
-
-### poe_pricer.py
-
-**What it does:** Local item pricing engine with zero network calls. Magic/rare items are scored using the `rare_scorer` algorithm. Uniques, gems, currency, and divination cards are looked up from the local poe.ninja snapshot database. Reloads the scorer module from source on every call so edits take effect immediately.
-
-#### Tools
-
-| Tool | Description |
-|------|-------------|
-| **`price_item`** | Price a single item from a PoE API dict or clipboard text. |
-| **`price_items`** | Batch-price an array of PoE API item dicts. |
-| **`ninja_lookup`** | Look up poe.ninja price by name (exact or fuzzy). |
-
-#### price_item
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `item_dict` | object | -- | PoE API item dict (frameType, typeLine, explicitMods, etc.) |
-| `item_text` | string | -- | Raw clipboard text from PoE (Ctrl+C format) |
-
-Provide one of `item_dict` or `item_text`.
-
-**Returns (algo method):** JSON with `name`, `ilvl`, `rarity`, `method` ("algo"), `category`, `price_estimate`, `total_score`, `good_mods`, `junk_mods`, `breakdown`. If fractured: also `fractured` and `should_trade_check`.
-
-**Returns (ninja_db method):** JSON with `name`, `ilvl`, `rarity`, `method` ("ninja_db"), `category`, `price_estimate`.
-
-**Returns (not found):** JSON with `method` ("not_found"), `price_estimate` (null), `note`.
-
-#### price_items
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `items` | array[object] | *required* | Array of PoE API item dicts |
-| `min_price` | number | 0 | Only include items at or above this price |
-| `include_unpriced` | boolean | false | Include items that couldn't be priced |
-
-**Returns:** JSON with `total_items`, `priced_count`, `total_value_chaos`, `items` (sorted by price descending), and optionally `should_trade_check` (names of fractured items worth verifying on trade).
-
-#### ninja_lookup
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `name` | string | *required* | Item name (partial match supported) |
-
-**Returns (exact):** JSON with `name`, `price_chaos`, `category`, `match` ("exact").
-
-**Returns (fuzzy):** JSON with `query`, `match` ("fuzzy"), `results` array of `{name, price_chaos, category}`.
-
----
-
-### poe_stash.py
-
-**What it does:** Stash tab access with caching, item search, rare scoring, and tab pricing. Uses a 5-minute cache via `StashCache` to avoid excessive API calls.
-
-#### Tools
-
-| Tool | Description |
-|------|-------------|
-| **`get_tab`** | Get all items from a stash tab by name or index. |
-| **`list_tabs`** | List all stash tab names and indices. |
-| **`score_rare`** | Score a rare item from PoE clipboard text. |
-| **`price_tab`** | Score and price all rare items in a stash tab. |
-| **`find_items`** | Search stash tabs for items by name, base type, or mod text. |
-| **`cache_status`** | Show cache freshness for stash tabs. |
-
-#### get_tab
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `tab_name` | string | -- | Tab name (case-insensitive) |
-| `tab_index` | integer | -- | Tab index (0-based) |
-| `force` | boolean | false | Force refresh, bypassing cache |
-
-Provide one of `tab_name` or `tab_index`.
-
-**Returns:** JSON with `count` and `items` array. Each item includes `name`, `baseType`, `rarity`, `ilvl`, `category`, `mods`, `implicitMods`, `craftedMods`, `enchantMods`, `sockets`, `requirements`, and grid position (`x`, `y`, `w`, `h`) if present.
-
-#### list_tabs
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `force` | boolean | false | Force refresh tab list |
-
-**Returns:** Array of `{index, name, type}` for each tab.
-
-#### score_rare
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `item_text` | string | *required* | Raw item text from PoE (Ctrl+C) |
-
-**Returns:** JSON with `name`, `category`, `ilvl`, `price_estimate`, `total_score`, `affix_count`, `good_mods`, `junk_mods`, `breakdown`.
-
-#### price_tab
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `tab_name` | string | -- | Tab name (case-insensitive) |
-| `tab_index` | integer | -- | Tab index (0-based) |
-| `min_price` | integer | 1 | Minimum chaos value to include |
-| `force` | boolean | false | Force refresh stash data |
-
-**Returns:** JSON with `total_rares`, `priced_items`, `total_value`, `items` (sorted by score descending, each with name, category, price, score, good_mods, junk_mods, breakdown).
-
-**Notable:** Reads directly from disk cache rather than hitting the API. Requires a prior `get_tab` or `list_tabs` call to populate the cache.
-
-#### find_items
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `query` | string | *required* | Search term (matches name, base type, or mod text) |
-| `tab_name` | string | -- | Search only this tab (searches first 10 tabs if omitted) |
-| `force` | boolean | false | Force refresh |
-
-**Returns:** JSON with `matches` count and `items` array. Rare items include `price_estimate` and `score`.
-
-#### cache_status
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| (none) | | | |
-
-**Returns:** JSON with `league` and `tabs` array (index, name, cached, age_seconds, fresh). Shows first 15 tabs.
-
----
-
-### poe_trade.py
-
-**What it does:** Search and fetch from the official `pathofexile.com/api/trade`. General-purpose trade API wrapper supporting any item type. Always enforces priced/instant-buyout listings (`sale_type: priced`). Includes automatic retry with backoff on HTTP 429 rate limits.
-
-#### Tools
-
-| Tool | Description |
-|------|-------------|
-| **`search_trade`** | Search the PoE trade site with stat/category/price filters. |
-| **`get_stat_ids`** | Search for trade stat filter IDs by keyword. |
-| **`search_by_item_mods`** | Search trade by human-readable mod text (no stat IDs needed). |
-| **`fetch_listing`** | Fetch detailed info for specific listing IDs from a previous search. |
-
-#### search_trade
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `league` | string | "Mirage" | League name |
-| `category` | string | -- | Item category (e.g., "weapon.wand", "armour.body", "accessory.ring") |
-| `rarity` | string | "any" | "nonunique", "unique", or "any" |
-| `name` | string | -- | Item name (for uniques) |
-| `base_type` | string | -- | Base type filter (e.g., "Opal Wand") |
-| `stats` | array | -- | Stat filters, each `{id, min, max}` |
-| `min_price` | number | -- | Minimum price in chaos |
-| `max_price` | number | -- | Maximum price in chaos |
-| `max_level` | integer | -- | Maximum level requirement |
-| `instant_buyout` | boolean | true (when max_price set) | Only show priced listings |
-| `online_only` | boolean | true | Only show online sellers |
-| `account` | string | -- | Filter by seller account name |
-| `min_links` | number | -- | Minimum linked sockets |
-| `limit` | integer | 10 | Max results (capped at 20) |
-
-**Returns:** JSON with `total`, `showing`, `trade_url` (clickable link to results on trade site), `query_id`, and `results` array. Each result includes `id`, `name`, `base_type`, `ilvl`, `price_amount`, `price_currency`, `account`, `implicit_mods`, `explicit_mods`, `crafted_mods`, `corrupted`, `level_req`, `sockets`.
-
-#### get_stat_ids
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `query` | string | *required* | Keyword to search (e.g., "attack speed", "fire resistance") |
-| `limit` | integer | 10 | Max results |
-
-**Returns:** Array of `{id, text, type}` for matching stat filter IDs.
-
-#### search_by_item_mods
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `mods` | array | -- | List of `{text, is_local?, min_pct?}` objects. `min_pct` defaults to 0.7 (70% of rolled value). |
-| `item_category` | string | -- | Trade category (e.g., "weapon.wand") |
-| `unique_name` | string | -- | For uniques: search by name instead of mods |
-| `league` | string | "Mirage" | League name |
-| `limit` | integer | 10 | Max results |
-
-**Returns:** Same format as `search_trade`.
-
-**Notable:** Converts human-readable mod text to stat IDs automatically using a pattern-matching index built from the trade stats API. Normalizes numbers to `#` placeholders for fuzzy matching. Handles local weapon mods (e.g., "increased Physical Damage (local)") separately.
-
-#### fetch_listing
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `query_id` | string | *required* | Query ID from a previous search result |
-| `listing_ids` | string | *required* | Comma-separated listing IDs (max 10) |
-
-**Returns:** Array of parsed listing objects.
-
----
-
-## Dependencies
-
-### Shared Utilities
-
-| Module | Location | Purpose |
-|--------|----------|---------|
-| `mcp_server_utils.py` | this repo | Shared `run_server()` function that handles stdio vs SSE mode selection based on CLI args |
-
-### Included Libraries
-
-These modules live directly in this repo:
-
-| Module | Purpose |
-|--------|---------|
-| `poe_lib.py` | `PoeApi` HTTP client for the PoE character-window API (POESESSID cookie auth), `load_config()` reading credentials from `POE_SESSION_ID` / `POE_ACCOUNT_NAME` env vars or `config.json`. `build_pob_xml` and `PobAnalyzer` are stubs — use pob-mcp's `lua_import_character` instead. |
-| `stash_cache.py` | `StashCache` class — 5-minute disk cache at `~/.cache/poe-trade-mcp/{league}/` for stash tab data. |
-| `rare_scorer.py` | `score_item()`, `score_item_text()`, `classify_item()` — mod triage scorer. Scores items by matching PoE API mod text strings against weighted rules for life, resistances, crit, speed, and damage. Does not produce price estimates; use the trade API for those. |
-
-### Price Database
-
-| Module | Location | Purpose |
-|--------|----------|---------|
-| `price_db.py` | sibling of this repo | SQLite interface for `price_history.db` |
-
-The database is populated by an external `trend_watcher.py` process that scrapes poe.ninja periodically. Point it at a directory of your choosing.
-
-### Path of Building (PoB) Brain
-
-| Module | Location | Purpose |
-|--------|----------|---------|
-| `server.py` | separate repo | pob-brain MCP server — headless Path of Building with Lua eval, build loading, stat extraction |
-
----
-
-## Setup
-
-### Prerequisites
-
-- Python 3.10+
-- Install Python dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-- Credentials are read from env vars (set in `.mcp.json`) — no `config.json` required:
-
-| Env var | Required | Description |
-|---------|----------|-------------|
-| `POE_SESSION_ID` | Yes | Your `POESESSID` cookie value |
-| `POE_ACCOUNT_NAME` | Yes | Account name with or without discriminator (e.g. `Account#1234`) |
-| `POE_LEAGUE` | Yes | Current league name (e.g. `Mirage`) — used by stash tools |
-| `POE_CONTACT_EMAIL` | Yes | Your email — included in the API `User-Agent` as required by GGG |
-| `POE_CHARACTER_NAME` | No | Default character for `get_character` calls |
-| `POE_CLIENT_ID` | No | Developer app client_id for OAuth upgrade (register at pathofexile.com/developer). When set and tokens are saved via `poe_auth`, stash calls use the newer api.pathofexile.com endpoints. POESESSID is always used as fallback. |
-| `POE_FILTER_PATH` | No | Path to your `.filter` file (poe_filter tools) |
-
-Optionally, a `config.json` in this directory can supply the same keys (`poesessid`, `account`, `character`) as a fallback — env vars always take precedence.
-
-### Running Individual Servers
-
-Each module can run standalone:
-
-```bash
-python poe_market.py       # stdio mode
-python poe_market.py sse   # SSE mode on its assigned port
-```
-
-### Running the Combined Server
-
-```bash
-python poe_all.py           # stdio mode — all tools under one connection
-python poe_all.py sse       # SSE mode on port 8490
-```
-
----
-
-## MCP Registration
-
-Add to your `.mcp.json` (or Claude Desktop config) as a single entry using the combined server:
+The dependency range is deliberately `mcp>=1.26,<2`. MCP 2.x removed the
+`Server.list_tools` interface used here. PyPoE and RePoE are not runtime
+dependencies. Individual `poe_trade.py`, `poe_pricer.py`, `poe_market.py`,
+`poe_char.py`, `poe_stash.py`, and `poe_filter.py` entry points also use stdio.
+SSE is not implemented. Choose the interpreter in the suite configuration;
+this submodule does not install into or reconfigure a running suite.
+
+`poe_all.py` loads all six owned servers as one registry. Missing imports,
+invalid schemas, and duplicate tool names fail startup with the module named.
+All 39 declared tools are discoverable. Eight retained compatibility tools return
+explicit unsupported errors; they are documented below. Sibling `pob_vault_mcp`
+and `server` modules are intentionally not part of this registry: launch those
+through their own suite configuration.
+
+## Configuration
+
+| Setting | Behavior |
+|---|---|
+| `POE_LEAGUE` | Exact league fallback for trade/pricing/cache tools. A tool's explicit `league` wins. No auto-selection or hardcoded season. |
+| `POE_PRICE_DB` | Optional SQLite path; default `.cache/poe2-prices.sqlite3` inside this submodule. No legacy PoE1 DB is loaded. |
+| `POE_FILTER_PATH` | Local `.filter` path; default `~/Documents/My Games/Path of Exile 2/Starting.filter`. |
+| `POE_ACCOUNT_NAME`, `POE_CHARACTER_NAME`, `POE_NINJA_LEAGUE_SLUG` | Optional defaults for public character URLs. Prefer an explicit `profile_url`. |
+| `POE2_CHROME_PATH` | Optional existing Chromium/Chrome executable for character snapshots. |
+
+There is no session-cookie or OAuth configuration in this port. It never reads
+`config.json`, session tokens, browser login profiles, or sibling credentials.
+The historical `poe_oauth.py`, `stash_cache.py`, and `rare_scorer.py` files are
+retained as inactive source; owned MCP tools do not call them.
+
+## Trade
+
+`get_trade_leagues`, `get_trade_filters`, and `get_stat_ids` read official
+`/api/trade2/data/*` metadata. `search_trade` and `search_by_item_mods` use
+`/api/trade2/search/poe2/{league}` and return
+`/trade2/search/poe2/{league}/{query_id}`. Search is read-only; no message,
+purchase, whisper, or seller-contact action exists.
+
+- Categories and stat IDs are checked against PoE2 metadata. For example,
+  Body Armour uses `armour.chest`; use discovery instead of PoE1 IDs.
+- Prices have an explicit `price_currency`: `divine` (default), `exalted`, or
+  `chaos`. Zero bounds are preserved; inverted bounds are rejected.
+- `online_only` defaults to true. `instant_buyout=true` selects `securable`;
+  it filters listings and does not buy anything. The metadata default for
+  buyout/fixed-price is represented by **omitting** `sale_type`; sending a JSON
+  null option is rejected by the live API with HTTP 400.
+- PoE1 `min_links`, malformed stat arrays, and unmatched/ambiguous textual
+  mods fail explicitly. Multi-number or negative mods require explicit stat
+  IDs and bounds rather than an inferred range.
+- `fetch_listing` accepts an array of 1–10 explicitly supplied IDs and a query
+  ID. It returns item/price details without contact information or whisper text.
+- Requests are anonymous. HTTP denial/rate limits are errors; there is no
+  credential fallback, Cloudflare bypass, silent broadening, or automatic retry.
+
+## Prices and local history
+
+The implementation follows [poe.ninja's public API reference](https://poe.ninja/docs/api).
+Use `get_economy_leagues` and `get_economy_categories` to select an exact league
+and category. Prefer an explicit category to keep each lookup small.
 
 ```json
-{
-    "mcpServers": {
-        "poe-trade-mcp": {
-            "command": "python",
-            "args": ["/path/to/poe-trade-mcp/poe_all.py"],
-            "env": {
-                "POE_FILTER_PATH": "/path/to/Your.filter",
-                "POE_CONFIG_PATH": "/path/to/poe_monitor/config.json"
-            }
-        }
-    }
-}
+{"name":"Divine Orb","league":"Forbidden Rites","category":"Currency"}
 ```
-
-Or register individual servers separately:
 
 ```json
-{
-    "mcpServers": {
-        "poe-market": {
-            "command": "python",
-            "args": ["/path/to/poe-trade-mcp/poe_market.py"]
-        },
-        "poe-stash": {
-            "command": "python",
-            "args": ["/path/to/poe-trade-mcp/poe_stash.py"]
-        },
-        "poe-trade": {
-            "command": "python",
-            "args": ["/path/to/poe-trade-mcp/poe_trade.py"]
-        },
-        "poe-char": {
-            "command": "python",
-            "args": ["/path/to/poe-trade-mcp/poe_char.py"]
-        },
-        "poe-pricer": {
-            "command": "python",
-            "args": ["/path/to/poe-trade-mcp/poe_pricer.py"]
-        },
-        "poe-filter": {
-            "command": "python",
-            "args": ["/path/to/poe-trade-mcp/poe_filter.py"]
-        }
-    }
-}
+{"name":"Choir of the Storm","league":"Forbidden Rites","category":"UniqueAccessories"}
 ```
+
+Currency-like categories use `/poe2/api/economy/exchange/current/overview`.
+Equipment uses `/poe2/api/economy/stash/current/item/overview` with **plural**
+category names such as `UniqueAccessories` and `UniqueWeapons`.
+The complete category list is in [TOOLS.md](TOOLS.md).
+
+Every price retains the source's `price` and `currency` (`core.primary`).
+`core.rates` expresses units of a target currency per primary currency, so a
+price of 2 divine with a chaos rate of 9.1 becomes 18.2 chaos. Exchange volume
+is `volume_primary_value`, not a listing count. Stash estimates retain
+`listing_count`, `base_type`, `variant`, and `corrupted`.
+
+`ninja_lookup` retains all matching variants. Single-item pricing refuses an
+ambiguous exact name; it never selects the highest-priced variant. Supply a
+category/variant and, in `item_dict`, base type/corruption to disambiguate.
+`price_estimate` is the compatibility chaos value, explicitly tagged with its
+currency; it is null when conversion is unavailable. A named unique estimate
+is not an appraisal of its exact rolls. Normal/magic/rare equipment gets an
+explicit unsupported result with a null estimate, not a PoE1 heuristic price.
+Batch totals are per supplied unit; stack sizes are not multiplied.
+
+Successful overview fetches populate a real SQLite history automatically.
+`refresh_prices` fetches one category explicitly. `get_price`, `search_items`,
+`get_price_history`, and movement tools only query this local history. Cache
+identity includes league, category, item ID, variant, base type, corruption and
+currency for trend comparison. No cross-league prices are merged. A latest
+category snapshot replaces that category's visible coverage; delisted items do
+not survive as current prices. No observations means a useful error directing
+the caller to refresh; `snapshot_status` can inspect an empty cache.
+
+Public economy responses are cached for an hour, with ETag revalidation and
+cache headers respected. Trade metadata uses an hour cache. Requests are
+serialized and spaced by at least 1.5 seconds per host, widened by GGG rate
+headers. HTTP 429 establishes a shared cooldown from `Retry-After` and returns
+an error. No polling or background collector is started. Reusing a cached or
+304 response does not invent another historical observation.
+
+`fetched_at` is **our fetch time**, not the age of game data. `source_timestamp`
+is null when the source does not provide it. HTTP `Date`/`Age` are reported
+separately. Source errors and invalid schemas are never cached as empty results.
+A category omitted from local history is not evidence that an item is worthless.
+
+## Public character snapshots
+
+Install the optional browser dependency and either install Playwright Chromium
+or point to an existing browser:
+
+```sh
+python -m pip install -r requirements-character.txt
+python -m playwright install chromium
+```
+
+Call `get_character`, `get_socketed_gems`, or `get_character_pob` with:
+
+```json
+{"profile_url":"https://poe.ninja/poe2/profile/ACCOUNT/LEAGUE_SLUG/character/CHARACTER"}
+```
+
+The exact league slug comes from the source URL: for example `forbiddenrites`,
+not a guessed `forbidden-rites`. A fresh anonymous browser context reads the
+visible public page and its **Import code for Path of Building** field. This
+code does not call ninja's internal builds/profile APIs directly. Missing,
+private, redirected, or incomplete exports are errors, with no authenticated
+fallback. Optional browser dependencies do not prevent server startup.
+
+The local adapter validates account/name, requires displayed source freshness,
+and decodes only a complete `PathOfBuilding2` export with bounded decompression
+and XML entity/DTD protection. Equipment sets, skill/support groups, tree specs,
+configuration and calculated stats remain distinct. Calculated stats are PoB
+outputs, not in-game measurements. The return shape is:
+
+- `get_character`: build/items/item_sets/skills/trees/configuration and source.
+- `get_socketed_gems`: PoE2 skill groups and source; no PoE1 socket-color model.
+- `get_character_pob`: `pob_xml`, `pob_code`, and source in JSON. Pass `pob_xml`
+  to the separate PoB2 server.
+
+Source includes `source_age_text_at_capture`, `captured_at`,
+`cache_age_seconds`, exact URL, and a null exact source timestamp when unknown.
+The displayed age is retained as text, not presented as live character data.
+Snapshots are kept only in process memory for 15 minutes. A global one-minute
+profile-fetch cooldown limits uncached requests. No private data is published.
+
+## Remaining work after this bounded slice
+
+- `list_tabs`, `get_tab`, `price_tab`, `find_items`, `cache_status`,
+  `poe_auth` and `scan_stash_tabs` are not implemented in this
+  public-only port. GGG's [reference](https://www.pathofexile.com/developer/docs/reference)
+  labels account/guild/public stashes PoE1-only; official character access needs
+  OAuth. No credentials are requested or harvested.
+- `score_rare` works locally: it extracts PoE2 clipboard mods, identifies
+  comparison criteria (including Spirit, skill levels, Critical Damage Bonus),
+  preserves unknown text, and returns a null price. It does not call a source
+  or pretend that arbitrary mod weights are market prices.
+- `poe_auth_status` reports the audited OAuth capability and implementation
+  state, **not token validity**. Token status is `not_inspected`. Official
+  `GET https://api.pathofexile.com/character/poe2` and
+  `GET https://api.pathofexile.com/character/poe2/{name}` support PoE2 with
+  `account:characters`; implementation and authenticated verification remain.
+- `kf_check` returns an unsupported error: its inherited PoE1 breakpoint model
+  has no verified PoE2 basis.
+- Exact baseline copies of replaced character/stash/library modules are in
+  [legacy/](legacy/README.md). Their APIs and unported functionality remain
+  available for the main agent to audit; this is not a complete suite port.
+- Browser/profile page changes can break public exports. Missing optional
+  dependencies, browser binaries, blocked pages, or missing source age are
+  surfaced; there is no hidden fallback to private APIs.
+- There is no historical backfill, background polling, appraisal of exact rolls,
+  automatic purchase, or headless PoB engine in this submodule.
+- Filter tools edit only local files; they do not publish filters or validate
+  all game-version syntax. Existing filter parser behavior is otherwise retained.
+
+## Verification
+
+```sh
+python -m pip install -r requirements-dev.txt
+python -m pytest tests -q
+```
+
+Tests use synthetic fixtures and mocked HTTP, plus a real MCP subprocess and
+stdio client from an unrelated working directory. They cover discovery,
+missing/duplicate module failures, schema errors, PoE2 URLs/currency units,
+variant ambiguity, league-separated history, source failures, ETags/cooldowns,
+and public export validation. Live probes are separate from the offline suite;
+see [PORT_REPORT.md](PORT_REPORT.md) for observations and limits.
+
+This product is not affiliated with or endorsed by Grinding Gear Games.

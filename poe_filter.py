@@ -20,7 +20,7 @@ import re
 import sys
 from pathlib import Path
 
-from mcp.server import Server
+from mcp_server_utils import Server
 from mcp.types import TextContent, Tool
 
 # Default filter path — configure via POE_FILTER_PATH env var.
@@ -28,7 +28,7 @@ from mcp.types import TextContent, Tool
 import os as _os
 DEFAULT_FILTER = Path(
     _os.environ.get("POE_FILTER_PATH") or
-    str(Path.home() / "Documents" / "My Games" / "Path of Exile" / "Starting.filter")
+    str(Path.home() / "Documents" / "My Games" / "Path of Exile 2" / "Starting.filter")
 )
 
 app = Server("poe-filter")

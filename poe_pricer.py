@@ -1,290 +1,369 @@
-"""PoE Pricer MCP Server — live poe.ninja pricing.
+"""PoE2 public poe.ninja overviews with currency-aware, variant-aware pricing."""
 
-For magic/rare items: uses the rare_scorer.py algorithm (if available).
-For everything else (uniques, currency, gems, divination cards, etc.):
-  queries poe.ninja live via exchange and stash API endpoints.
+import math
+import urllib.parse
+import anyio
+from mcp.types import Tool
+from mcp_server_utils import Server, result, run_server
+from poe_lib import resolve_league
+from price_db import PriceCache
+from public_http import request_json
 
-Tools:
-  ninja_lookup — look up current poe.ninja price for any named item
-  price_item   — price a single item (PoE API dict OR clipboard text)
-  price_items  — price a batch of items (array of PoE API dicts)
-
-Version: 2.0
-"""
-import importlib.util as _iutil
-import json
-import sys
-import time
-import urllib.request
-from pathlib import Path
-
-# Ensure this server's own directory is on the path so sibling modules are found
-_HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
-_SCORER_PATH = _HERE / "rare_scorer.py"
-
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
-
+NINJA_EXCHANGE_URL = "https://poe.ninja/poe2/api/economy/exchange/current/overview"
+NINJA_STASH_URL = "https://poe.ninja/poe2/api/economy/stash/current/item/overview"
+NINJA_LEAGUES_URL = "https://poe.ninja/poe2/api/economy/leagues"
+_EXCHANGE_TYPES = [
+    "Currency",
+    "Fragments",
+    "Abyss",
+    "UncutGems",
+    "LineageSupportGems",
+    "Essences",
+    "SoulCores",
+    "Idols",
+    "Runes",
+    "Ritual",
+    "Expedition",
+    "Delirium",
+    "Breach",
+    "Verisium",
+]
+_STASH_TYPES = [
+    "UniqueWeapons",
+    "UniqueArmours",
+    "UniqueAccessories",
+    "UniqueFlasks",
+    "UniqueCharms",
+    "UniqueJewels",
+    "UniqueSanctumRelics",
+    "UniqueTablets",
+    "PrecursorTablets",
+]
+CATEGORIES = _EXCHANGE_TYPES + _STASH_TYPES
+_NINJA_TTL = 3600
 app = Server("poe-pricer")
 
-# ── poe.ninja live API ──────────────────────────────────────────────────────────
 
-NINJA_EXCHANGE_URL = "https://poe.ninja/poe1/api/economy/exchange/current/overview"
-NINJA_STASH_URL    = "https://poe.ninja/poe1/api/economy/stash/current/item/overview"
-_NINJA_HEADERS     = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-_NINJA_TTL         = 900  # 15 minutes
-
-# Exchange endpoint types (bulk tradeable)
-_EXCHANGE_TYPES = [
-    "Currency", "Fragment", "DivinationCard", "Scarab", "Essence", "Oil",
-    "Fossil", "Omen", "Tattoo", "AllflameEmber", "Artifact", "DeliriumOrb",
-    "Astrolabe", "Resonator", "Wombgift", "Incubator",
-]
-
-# Stash endpoint types (equipment, gems, maps)
-_STASH_TYPES = [
-    "UniqueWeapon", "UniqueArmour", "UniqueAccessory", "UniqueFlask", "UniqueJewel",
-    "ForbiddenJewel", "ShrineBelt", "UniqueTincture", "UniqueRelic",
-    "SkillGem", "ClusterJewel",
-    "Map", "BlightedMap", "BlightRavagedMap", "UniqueMap",
-    "Invitation", "BaseType", "Beast", "Vial",
-]
-
-# Cache: key = (endpoint_url, league, type_name) → (timestamp, lines, items)
-_cache: dict[tuple, tuple] = {}
+def _number(value, field):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (float, int))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ValueError(f"Invalid or missing {field} in PoE2 overview")
+    return value
 
 
-def _fetch(url: str, league: str, type_name: str) -> tuple[list, list]:
-    """Fetch from poe.ninja with caching. Returns (lines, items)."""
-    key = (url, league, type_name)
-    cached = _cache.get(key)
-    if cached and (time.time() - cached[0]) < _NINJA_TTL:
-        return cached[1], cached[2]
-    try:
-        full_url = f"{url}?league={urllib.parse.quote(league)}&type={type_name}"
-        req = urllib.request.Request(full_url, headers=_NINJA_HEADERS)
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read())
-        lines = data.get("lines", [])
-        items = data.get("items", [])
-        _cache[key] = (time.time(), lines, items)
-        return lines, items
-    except Exception:
-        return [], []
+def normalize_overview(data, category, league, meta):
+    if not isinstance(data, dict) or not isinstance(data.get("lines"), list):
+        raise ValueError("Invalid PoE2 overview: expected lines array")
+    core = data.get("core", {})
+    primary = core.get("primary")
+    if not isinstance(primary, str) or not primary:
+        raise ValueError("PoE2 overview has no core.primary currency")
+    rates = dict(core.get("rates", {}))
+    rates[primary] = 1
+    rates = {k: _number(v, f"core.rates.{k}") for k, v in rates.items()}
+    item_map = {
+        str(item["id"]): item for item in data.get("items", []) + core.get("items", [])
+    }
+    rows = []
+    exchange = category in _EXCHANGE_TYPES
+    for line in data["lines"]:
+        price = _number(line.get("primaryValue"), "primaryValue")
+        item = item_map.get(str(line.get("id")), {}) if exchange else line
+        name = item.get("name")
+        if not name or "id" not in line:
+            raise ValueError("PoE2 overview line lacks item id/name metadata")
+        row = {
+            "id": str(line["id"]),
+            "name": name,
+            "game": "poe2",
+            "league": league,
+            "category": category,
+            "price": price,
+            "currency": primary,
+            "primary_value": price,
+            "chaos_value": price * rates["chaos"] if rates.get("chaos") else None,
+            "divine_value": price * rates["divine"] if rates.get("divine") else None,
+            "exalted_value": price * rates["exalted"] if rates.get("exalted") else None,
+            "source": "poe.ninja exchange" if exchange else "poe.ninja stash estimate",
+            **meta,
+        }
+        if exchange:
+            row["volume_primary_value"] = line.get("volumePrimaryValue")
+            row["volume_currency"] = primary
+        else:
+            row.update(
+                base_type=line.get("baseType"),
+                variant=line.get("variant"),
+                corrupted=line.get("corrupted"),
+                listing_count=line.get("listingCount"),
+                details_id=line.get("detailsId"),
+            )
+        rows.append(row)
+    # Primary currency can be absent from the exchange lines. Its unit price is
+    # exactly 1; include only for the Currency category, with explicit provenance.
+    if (
+        category == "Currency"
+        and data["lines"]
+        and primary in item_map
+        and not any(r["id"] == primary for r in rows)
+    ):
+        rows.append(
+            {
+                "id": primary,
+                "name": item_map[primary]["name"],
+                "game": "poe2",
+                "league": league,
+                "category": category,
+                "price": 1,
+                "currency": primary,
+                "primary_value": 1,
+                "chaos_value": rates.get("chaos"),
+                "divine_value": rates.get("divine"),
+                "exalted_value": rates.get("exalted"),
+                "source": "poe.ninja core reference currency",
+                **meta,
+            }
+        )
+    return rows
 
 
-import urllib.parse  # noqa: E402 (import after definition above)
+def list_economy_leagues():
+    data, meta = request_json(NINJA_LEAGUES_URL, ttl=3600)
+    if not isinstance(data, list) or any(
+        not isinstance(v, dict) or not v.get("id") for v in data
+    ):
+        raise ValueError("Invalid PoE2 economy league response")
+    return {"leagues": data, **meta}
 
 
-def _ninja_lookup_live(query: str, league: str) -> list[dict]:
-    """Search poe.ninja live for items matching the query name. Returns list of matches."""
-    q = query.lower().strip()
+def fetch_category(league, category):
+    league = resolve_league(league)
+    if category not in CATEGORIES:
+        raise ValueError(
+            f"Unsupported PoE2 category: {category}; use get_economy_categories"
+        )
+    if league not in [v["id"] for v in list_economy_leagues()["leagues"]]:
+        raise ValueError(
+            f"League {league!r} is absent from the public PoE2 economy source"
+        )
+    base = NINJA_EXCHANGE_URL if category in _EXCHANGE_TYPES else NINJA_STASH_URL
+    url = base + "?" + urllib.parse.urlencode({"league": league, "type": category})
+    data, meta = request_json(url, ttl=_NINJA_TTL)
+    rows = normalize_overview(data, category, league, meta)
+    PriceCache().record(league, category, rows, fetched_at=meta["fetched_at"])
+    return rows
+
+
+def _ninja_lookup_live(query, league, category=None):
+    if not query.strip():
+        raise ValueError("Supply a nonempty item name")
+    # Without a category, search all supported categories sequentially. An exact
+    # match finishes the lookup after collecting every variant in that category.
     results = []
-
-    # Search exchange endpoint (currencies, div cards, scarabs, etc.)
-    for type_name in _EXCHANGE_TYPES:
-        lines, items = _fetch(NINJA_EXCHANGE_URL, league, type_name)
-        if not lines:
-            continue
-        id_to_name = {item["id"]: item["name"] for item in items}
-        for line in lines:
-            name = id_to_name.get(line.get("id", ""), "")
-            if not name:
-                continue
-            if q in name.lower() or name.lower() == q:
-                results.append({
-                    "name": name,
-                    "chaos_value": round(line.get("primaryValue", 0), 2),
-                    "divine_value": None,
-                    "listing_count": int(line.get("volumePrimaryValue", 0)),
-                    "category": type_name,
-                    "source": "exchange",
-                })
-                if name.lower() == q:
-                    return results  # exact match — stop early
-
-    # Search stash endpoint (uniques, gems, maps, etc.)
-    for type_name in _STASH_TYPES:
-        lines, _ = _fetch(NINJA_STASH_URL, league, type_name)
-        if not lines:
-            continue
-        for line in lines:
-            name = line.get("name", "")
-            if not name:
-                continue
-            if q in name.lower() or name.lower() == q:
-                results.append({
-                    "name": name,
-                    "chaos_value": round(line.get("chaosValue", 0), 2),
-                    "divine_value": round(line.get("divineValue", 0), 2) if line.get("divineValue") else None,
-                    "listing_count": line.get("listingCount", 0),
-                    "category": type_name,
-                    "variant": line.get("variant"),
-                    "gem_level": line.get("gemLevel"),
-                    "gem_quality": line.get("gemQuality"),
-                    "links": line.get("links"),
-                    "source": "stash",
-                })
-                if name.lower() == q:
-                    return results  # exact match — stop early
-
+    for selected in [category] if category else CATEGORIES:
+        rows = fetch_category(league, selected)
+        matches = [r for r in rows if query.casefold() in r["name"].casefold()]
+        results.extend(matches)
+        if any(r["name"].casefold() == query.casefold() for r in matches):
+            break
     return results
 
 
-def _best_ninja_price(name: str, league: str) -> dict | None:
-    """Return the single best (highest-value) poe.ninja result for an exact name."""
-    matches = [m for m in _ninja_lookup_live(name, league) if m["name"].lower() == name.lower()]
-    if not matches:
-        return None
-    return max(matches, key=lambda m: m["chaos_value"])
-
-
-# ── rare_scorer ─────────────────────────────────────────────────────────────────
-
-def _scorer():
-    """Load rare_scorer module. Raises if unavailable."""
-    if not _SCORER_PATH.exists():
-        raise FileNotFoundError(
-            f"rare_scorer.py not found at {_SCORER_PATH}. "
-            "Magic/rare item pricing requires the buildstuff poe_monitor module."
+def _best_ninja_price(
+    name, league, category=None, variant=None, base_type=None, corrupted=None
+):
+    rows = [
+        r
+        for r in _ninja_lookup_live(name, league, category)
+        if r["name"].casefold() == name.casefold()
+    ]
+    for key, value in [
+        ("variant", variant),
+        ("base_type", base_type),
+        ("corrupted", corrupted),
+    ]:
+        if value is not None:
+            rows = [r for r in rows if r.get(key) == value]
+    if len(rows) > 1:
+        raise ValueError(
+            "Multiple price variants match; supply category, variant, base_type and/or corrupted using ninja_lookup results"
         )
-    spec = _iutil.spec_from_file_location("rare_scorer", _SCORER_PATH)
-    mod = _iutil.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    return rows[0] if rows else None
 
 
-# ── Frame type constants ────────────────────────────────────────────────────────
-
-FRAME_RARE   = 2
-FRAME_MAGIC  = 1
-ALGO_FRAMES  = {FRAME_MAGIC, FRAME_RARE}
-NINJA_FRAMES = {3, 4, 5, 6, 9}
-
-RARITY_MAP = {
-    0: "Normal", 1: "Magic", 2: "Rare", 3: "Unique",
-    4: "Gem", 5: "Currency", 6: "DivinationCard", 9: "Unique (Foil)",
-}
-
-
-def _price_single_api_item(item: dict, league: str = "Mirage") -> dict:
-    """Price one PoE API item dict. Returns a result dict."""
-    frame      = item.get("frameType", 0)
-    name       = item.get("name", "").strip()
-    type_line  = item.get("typeLine", "").strip()
-    display    = f"{name} {type_line}".strip() if name else type_line
-    ilvl       = item.get("ilvl", 0)
-
-    if frame in ALGO_FRAMES:
-        try:
-            rs     = _scorer()
-            result = rs.score_item(item)
-            if result is None:
-                return {"name": display, "ilvl": ilvl, "rarity": RARITY_MAP.get(frame, "?"),
-                        "method": "algo", "price_estimate": 0, "note": "Could not score item"}
-            out = {
-                "name": result.name or display,
-                "ilvl": result.ilvl,
-                "rarity": RARITY_MAP.get(frame, "?"),
-                "method": "algo",
-                "category": result.category,
-                "price_estimate": result.price_estimate,
-                "total_score": result.total_score,
-                "good_mods": result.good_mod_count,
-                "junk_mods": result.junk_count,
-                "breakdown": result.breakdown,
-            }
-            if result.is_fractured:
-                out["fractured"] = True
-                out["should_trade_check"] = result.should_trade_check
-            return out
-        except FileNotFoundError as e:
-            return {"name": display, "ilvl": ilvl, "rarity": RARITY_MAP.get(frame, "?"),
-                    "method": "unavailable", "price_estimate": None, "note": str(e)}
-
-    # Named items — look up on poe.ninja live
-    lookup_name = name if name else type_line
-    ninja = _best_ninja_price(lookup_name, league)
-    if ninja:
-        out = {
-            "name": display,
-            "ilvl": ilvl,
-            "rarity": RARITY_MAP.get(frame, "?"),
-            "method": "ninja_live",
-            "category": ninja["category"],
-            "price_estimate": ninja["chaos_value"],
+def _price_single_api_item(item, league=None, category=None, variant=None):
+    league = resolve_league(league)
+    name = item.get("name", "").strip() or item.get("typeLine", "").strip()
+    if not name:
+        raise ValueError("Item must have name or typeLine")
+    if item.get("frameType") in (0, 1, 2):
+        return {
+            "name": name,
+            "method": "unsupported",
+            "price_estimate": None,
+            "league": league,
+            "note": "Normal/magic/rare equipment valuation is not calibrated for PoE2. Use a comparable trade search.",
         }
-        if ninja.get("divine_value"):
-            out["price_divine"] = ninja["divine_value"]
-        return out
+    price = _best_ninja_price(
+        name, league, category, variant, item.get("baseType"), item.get("corrupted")
+    )
+    if price is None:
+        return {
+            "name": name,
+            "method": "not_found",
+            "price_estimate": None,
+            "league": league,
+            "note": "No exact named item/variant found in the queried public categories.",
+        }
+    # price_estimate remains chaos for callers of the old API, with an explicit
+    # currency tag. Missing conversion stays null instead of becoming zero.
+    return {
+        **price,
+        "method": "ninja_public",
+        "price_estimate": price["chaos_value"],
+        "price_estimate_currency": "chaos",
+        "note": "Category/variant estimate, not an appraisal of these exact item rolls.",
+    }
 
-    return {"name": display, "ilvl": ilvl, "rarity": RARITY_MAP.get(frame, "?"),
-            "method": "not_found", "price_estimate": None,
-            "note": f"'{lookup_name}' not found on poe.ninja"}
 
-
-# ── Tool definitions ────────────────────────────────────────────────────────────
-
+COMMON = {
+    "league": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Exact PoE2 league; defaults only to POE_LEAGUE.",
+    },
+    "category": {
+        "type": "string",
+        "enum": CATEGORIES,
+        "description": "Prefer an explicit category to bound public requests.",
+    },
+    "variant": {"type": "string"},
+}
 TOOLS = [
     Tool(
+        name="get_economy_leagues",
+        description="List public PoE2 economy leagues without guessing a default.",
+        inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
+    ),
+    Tool(
+        name="get_economy_categories",
+        description="List supported PoE2 public price categories and currency semantics.",
+        inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
+    ),
+    Tool(
         name="ninja_lookup",
-        description=(
-            "Look up the current poe.ninja price for any named item — uniques, gems, "
-            "currency, divination cards, scarabs, maps, and more. Fetches live from "
-            "poe.ninja (cached 15 minutes). Supports partial name matching."
-        ),
+        description="Public PoE2 prices with reference currency, conversions, variants, source and fetch time; cached hourly.",
         inputSchema={
             "type": "object",
-            "properties": {
-                "name":   {"type": "string", "description": "Item name to look up (partial match supported)."},
-                "league": {"type": "string", "description": "League name (default: Mirage)."},
-            },
+            "properties": {**COMMON, "name": {"type": "string", "minLength": 1}},
             "required": ["name"],
+            "additionalProperties": False,
         },
     ),
     Tool(
         name="price_item",
-        description=(
-            "Price a single item. Accepts either:\n"
-            "  • item_dict: a PoE API item object (as returned by the stash or character API)\n"
-            "  • item_text: raw clipboard text from PoE (Ctrl+C)\n"
-            "Uniques, gems, currency, and divination cards are priced via live poe.ninja data. "
-            "Magic/rare items use the local rare_scorer algorithm when available."
-        ),
+        description="Estimate a named PoE2 item from public category/variant prices. Rare valuation is unsupported.",
         inputSchema={
             "type": "object",
             "properties": {
-                "item_dict": {"type": "object",  "description": "PoE API item dict."},
-                "item_text": {"type": "string",  "description": "Raw item text copied from PoE (Ctrl+C format)."},
-                "league":    {"type": "string",  "description": "League name (default: Mirage)."},
+                **COMMON,
+                "item_dict": {"type": "object"},
+                "item_text": {"type": "string", "minLength": 1},
             },
+            "oneOf": [{"required": ["item_dict"]}, {"required": ["item_text"]}],
+            "additionalProperties": False,
         },
     ),
     Tool(
         name="price_items",
-        description=(
-            "Price a batch of items in one call. Accepts an array of PoE API item dicts. "
-            "Returns results sorted by price (highest first). "
-            "Uniques/gems/currency use live poe.ninja data; magic/rare use rare_scorer if available."
-        ),
+        description="Price up to 100 supplied items using public PoE2 overviews. Totals report unpriced counts.",
         inputSchema={
             "type": "object",
             "properties": {
-                "items":           {"type": "array", "items": {"type": "object"}, "description": "Array of PoE API item dicts."},
-                "min_price":       {"type": "number", "description": "Only include items with price_estimate >= this value (default 0)."},
-                "include_unpriced":{"type": "boolean", "description": "Include items that couldn't be priced (default false)."},
-                "league":          {"type": "string", "description": "League name (default: Mirage)."},
+                **COMMON,
+                "items": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "maxItems": 100,
+                },
+                "min_price": {"type": "number", "minimum": 0},
+                "include_unpriced": {"type": "boolean"},
             },
             "required": ["items"],
+            "additionalProperties": False,
         },
     ),
 ]
 
 
-# ── Tool handler ─────────────────────────────────────────────────────────────────
+def _parse_clipboard(text):
+    lines = [s.strip() for s in text.strip().splitlines() if s.strip()]
+    for index, line in enumerate(lines):
+        if line.startswith("Rarity:") and index + 1 < len(lines):
+            rarity = line.split(":", 1)[1].strip()
+            frame = {
+                "Normal": 0,
+                "Magic": 1,
+                "Rare": 2,
+                "Unique": 3,
+                "Currency": 5,
+                "Gem": 4,
+            }.get(rarity)
+            if frame is None:
+                raise ValueError(f"Unsupported clipboard rarity: {rarity}")
+            return {"name": lines[index + 1], "frameType": frame}
+    raise ValueError("Expected English PoE clipboard text with Rarity and item name")
+
+
+def _dispatch(name, arguments):
+    if name == "get_economy_leagues":
+        return list_economy_leagues()
+    if name == "get_economy_categories":
+        return {
+            "exchange": _EXCHANGE_TYPES,
+            "stash": _STASH_TYPES,
+            "currency": "Read core.primary; rates convert one primary into target currency.",
+            "source": "https://poe.ninja/docs/api",
+        }
+    league = resolve_league(arguments.get("league"))
+    category, variant = arguments.get("category"), arguments.get("variant")
+    if name == "ninja_lookup":
+        rows = _ninja_lookup_live(arguments["name"], league, category)
+        if variant is not None:
+            rows = [r for r in rows if r.get("variant") == variant]
+        return {"league": league, "results": rows, "match_count": len(rows)}
+    if name == "price_item":
+        item = arguments.get("item_dict") or _parse_clipboard(arguments["item_text"])
+        return _price_single_api_item(item, league, category, variant)
+    rows = [
+        _price_single_api_item(i, league, category, variant) for i in arguments["items"]
+    ]
+    priced = [r for r in rows if r.get("price_estimate") is not None]
+    visible = [
+        r
+        for r in rows
+        if (r.get("price_estimate") is None and arguments.get("include_unpriced"))
+        or (
+            r.get("price_estimate") is not None
+            and r["price_estimate"] >= arguments.get("min_price", 0)
+        )
+    ]
+    return {
+        "league": league,
+        "total_items": len(rows),
+        "priced_count": len(priced),
+        "unpriced_count": len(rows) - len(priced),
+        "total_value_chaos": sum(r["price_estimate"] for r in priced),
+        "quantity_basis": "one unit per supplied item; stack sizes are not multiplied",
+        "items": sorted(
+            visible, key=lambda r: r.get("price_estimate") or 0, reverse=True
+        ),
+    }
+
 
 @app.list_tools()
 async def list_tools():
@@ -292,131 +371,9 @@ async def list_tools():
 
 
 @app.call_tool()
-async def call_tool(name: str, arguments: dict):
-    try:
-        league = arguments.get("league", "Mirage")
+async def call_tool(name, arguments):
+    return result(await anyio.to_thread.run_sync(_dispatch, name, arguments))
 
-        if name == "ninja_lookup":
-            query   = arguments["name"]
-            matches = _ninja_lookup_live(query, league)
-
-            if not matches:
-                return [TextContent(type="text", text=json.dumps(
-                    {"name": query, "league": league, "note": "Not found on poe.ninja"}, indent=2))]
-
-            # Deduplicate by name+variant, keep highest chaos value per entry
-            seen = {}
-            for m in matches:
-                key = (m["name"], m.get("variant"))
-                if key not in seen or m["chaos_value"] > seen[key]["chaos_value"]:
-                    seen[key] = m
-
-            results = sorted(seen.values(), key=lambda x: x["chaos_value"], reverse=True)[:10]
-            return [TextContent(type="text", text=json.dumps(
-                {"query": query, "league": league, "results": results}, indent=2))]
-
-        elif name == "price_item":
-            item_dict = arguments.get("item_dict")
-            item_text = arguments.get("item_text")
-
-            if item_dict:
-                result = _price_single_api_item(item_dict, league)
-                return [TextContent(type="text", text=json.dumps(result, indent=2))]
-
-            elif item_text:
-                # Parse item name from clipboard text
-                lines = [l.strip() for l in item_text.strip().splitlines() if l.strip()]
-                lookup_name = None
-                for i, line in enumerate(lines):
-                    if line.lower().startswith("rarity:"):
-                        rarity = line.split(":", 1)[1].strip().lower()
-                        if rarity in ("magic", "rare"):
-                            # Try rare_scorer
-                            try:
-                                rs = _scorer()
-                                algo_result = rs.score_item_text(item_text)
-                                if algo_result is not None:
-                                    out = {
-                                        "name": algo_result.name,
-                                        "ilvl": algo_result.ilvl,
-                                        "method": "algo",
-                                        "category": algo_result.category,
-                                        "price_estimate": algo_result.price_estimate,
-                                        "total_score": algo_result.total_score,
-                                        "good_mods": algo_result.good_mod_count,
-                                        "junk_mods": algo_result.junk_count,
-                                        "breakdown": algo_result.breakdown,
-                                    }
-                                    return [TextContent(type="text", text=json.dumps(out, indent=2))]
-                            except FileNotFoundError as e:
-                                return [TextContent(type="text", text=json.dumps(
-                                    {"note": str(e)}, indent=2))]
-                        if i + 1 < len(lines):
-                            lookup_name = lines[i + 1]
-                        break
-
-                if lookup_name:
-                    ninja = _best_ninja_price(lookup_name, league)
-                    if ninja:
-                        return [TextContent(type="text", text=json.dumps({
-                            "name": lookup_name, "method": "ninja_live",
-                            "league": league,
-                            "category": ninja["category"],
-                            "price_estimate": ninja["chaos_value"],
-                            "price_divine": ninja.get("divine_value"),
-                        }, indent=2))]
-
-                return [TextContent(type="text", text=json.dumps({
-                    "note": "Could not price item. Not a magic/rare and not found on poe.ninja.",
-                    "name": lookup_name, "league": league,
-                }, indent=2))]
-
-            else:
-                return [TextContent(type="text", text="Error: provide item_dict or item_text")]
-
-        elif name == "price_items":
-            items            = arguments.get("items", [])
-            min_price        = arguments.get("min_price", 0)
-            include_unpriced = arguments.get("include_unpriced", False)
-
-            results = []
-            for item in items:
-                r     = _price_single_api_item(item, league)
-                price = r.get("price_estimate")
-                if price is None:
-                    if include_unpriced:
-                        results.append(r)
-                elif price >= min_price:
-                    results.append(r)
-
-            results.sort(key=lambda x: x.get("price_estimate") or 0, reverse=True)
-
-            total_priced = sum(1 for r in results if r.get("price_estimate") is not None)
-            total_value  = sum(r.get("price_estimate") or 0 for r in results)
-            trade_check  = [r["name"] for r in results if r.get("should_trade_check")]
-
-            out = {
-                "total_items": len(items),
-                "priced_count": total_priced,
-                "total_value_chaos": round(total_value, 2),
-                "league": league,
-                "items": results,
-            }
-            if trade_check:
-                out["should_trade_check"] = trade_check
-            return [TextContent(type="text", text=json.dumps(out, indent=2))]
-
-        else:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
-
-    except Exception as e:
-        import traceback
-        return [TextContent(type="text", text=f"Error: {e}\n{traceback.format_exc()}")]
-
-
-# ── Entry point ──────────────────────────────────────────────────────────────────
-
-from mcp_server_utils import run_server
 
 if __name__ == "__main__":
-    run_server(app, port=8486, name="poe-pricer")
+    run_server(app)

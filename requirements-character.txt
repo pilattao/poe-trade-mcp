@@ -1,0 +1,3 @@
+-r requirements.txt
+# Optional public browser snapshot support. Install Chromium separately.
+playwright>=1.51,<2

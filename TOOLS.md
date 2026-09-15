@@ -1,90 +1,29 @@
-# poe-trade-mcp — Tool Reference
+# Owned PoE2 tools
 
-Multi-server MCP bundle for Path of Exile. All tools are prefixed `mcp__poe__` in the Claude context.
-Entry point: `poe_all.py`.
+All names below are registered by `poe_all.py`. Errors have MCP `isError=true`.
+Read [README.md](README.md) for source semantics and configuration.
 
----
+| Server | Tools | Capability |
+|---|---|---|
+| trade | `search_trade`, `search_by_item_mods`, `fetch_listing`, `get_stat_ids`, `get_trade_filters`, `get_trade_leagues` | Anonymous read-only PoE2 trade website requests. Availability depends on public access. |
+| pricer | `ninja_lookup`, `price_item`, `price_items`, `get_economy_leagues`, `get_economy_categories` | Public PoE2 overviews; exact units, variant-aware prices, hourly cache. |
+| market | `get_price`, `get_price_history`, `search_items`, `get_risers`, `get_fallers`, `get_movers`, `snapshot_status`, `refresh_prices` | Real local SQLite observations, separated by league/category/variant. |
+| char | `get_character`, `get_socketed_gems`, `get_character_pob` | Visible public ninja profile/PoB2 export with age. Optional Playwright + Chromium. |
+| char | `scan_stash_tabs`, `kf_check` | Explicit unsupported errors: private stash / unverified PoE1 breakpoint model. |
+| stash | `score_rare`, `poe_auth_status` | Local PoE2 clipboard comparison analysis; audited OAuth capability status without reading tokens. |
+| stash | `poe_auth`, `get_tab`, `list_tabs`, `price_tab`, `find_items`, `cache_status` | Explicit not-implemented errors; preserved source and exact API gaps in PORT_REPORT.md. |
+| filter | `get_filter_info`, `find_blocks`, `get_block`, `add_block`, `remove_block`, `replace_block`, `set_basetype_rule` | Existing local file operations with PoE2 default directory and protocol error status. |
 
-## poe-market — Price History
+**39 tools total: 31 implemented, 8 explicit compatibility errors.**
 
-Local price history database built from scraping poe.ninja snapshots.
+## Economy categories
 
-| Tool | Description |
-|------|-------------|
-| `get_price` | Latest price for a specific item (chaos value + category) |
-| `get_price_history` | Full price trajectory for an item across all snapshots |
-| `search_items` | Search items by name substring; returns latest price for each match |
-| `get_risers` | Items with the biggest positive price increase (% change) |
-| `get_fallers` | Items with the biggest negative price drop (% change) |
-| `get_movers` | Items with the biggest absolute price movement (up or down) |
-| `snapshot_status` | Database info: total snapshots, latest fetch time, total items tracked |
+| Source | Accepted PoE2 category types |
+|---|---|
+| Exchange | `Currency`, `Fragments`, `Abyss`, `UncutGems`, `LineageSupportGems`, `Essences`, `SoulCores`, `Idols`, `Runes`, `Ritual`, `Expedition`, `Delirium`, `Breach`, `Verisium` |
+| Stash overview | `UniqueWeapons`, `UniqueArmours`, `UniqueAccessories`, `UniqueFlasks`, `UniqueCharms`, `UniqueJewels`, `UniqueSanctumRelics`, `UniqueTablets`, `PrecursorTablets` |
 
----
-
-## poe-stash — Stash Tab Management
-
-> ⚠️ **`list_tabs`, `get_tab`, `find_items`, and `scan_stash_tabs` are currently blocked.** GGG disabled the legacy `character-window/get-stash-items` endpoint; calls return HTTP 403. OAuth developer registration is required for full stash access (designed for public apps, not personal tools). **`score_rare` and `price_tab` still work.** For bulk stash scanning, use [WealthyExile](https://www.wealthyexile.com). See [`playbooks/stash-scanning.md`](../playbooks/stash-scanning.md).
-
-| Tool | Description |
-|------|-------------|
-| `list_tabs` | ⛔ Blocked — List all stash tab names and indices |
-| `get_tab` | ⛔ Blocked — Get all items from a stash tab by name or index (5-min cache) |
-| `find_items` | ⛔ Blocked — Search stash tabs for items matching a query (name, base, or mod text) |
-| `score_rare` | ✅ Score a rare item from PoE clipboard text; returns price estimate + mod breakdown |
-| `price_tab` | ✅ Score and price all rare items in a stash tab, sorted by value (cache-only; populate with `get_tab` first) |
-| `cache_status` | Show cache freshness for stash tabs |
-
----
-
-## poe-trade — Trade Site Search
-
-Queries the official Path of Exile trade API. **`search_trade` and `search_by_item_mods` return a clickable trade URL + total count only (ExileExchange pattern) — no listing details fetched. User opens the URL in their browser.**
-
-| Tool | Description |
-|------|-------------|
-| `search_trade` | Search trade for items with filters; returns trade URL + total count |
-| `get_stat_ids` | Look up trade filter stat IDs by keyword |
-| `search_by_item_mods` | Search trade by mod text without needing stat IDs; returns trade URL + total count |
-| `fetch_listing` | Fetch full details for specific listing IDs from a previous search (use sparingly) |
-
----
-
-## poe-char — Character Data
-
-Fetches live character data from the PoE API.
-
-| Tool | Description |
-|------|-------------|
-| `get_character` | Fetch live gear and passive tree for the configured character |
-| `get_socketed_gems` | Exact socket layout + gem placement per equipped item from the PoE API (colours, links, which gem in each socket, empty sockets) — the authoritative binding PoB discards |
-| `get_character_pob` | Fetch character data and return a PoB-ready XML build |
-| `scan_stash_tabs` | Price all stash tabs whose name starts with `_` |
-| `kf_check` | Kinetic Fusillade breakpoint analysis via headless PoB (attack rate vs max effective APS) |
-
----
-
-## poe-pricer — Item Pricing
-
-Prices individual items using poe.ninja and the rare scorer.
-
-| Tool | Description |
-|------|-------------|
-| `ninja_lookup` | poe.ninja price for any named item (cached 15 min) |
-| `price_item` | Price a single item from API dict or clipboard text |
-| `price_items` | Price a batch of items, sorted by price (highest first) |
-
----
-
-## poe-filter — Loot Filter Editing
-
-Read and edit a local `.filter` file in place.
-
-| Tool | Description |
-|------|-------------|
-| `get_filter_info` | Summary: file path, total lines, block count, section headers |
-| `find_blocks` | Search filter blocks by keyword; returns block type, comment, and line numbers |
-| `get_block` | Get the full text of a block by starting line number |
-| `add_block` | Insert a new filter block at top/bottom/after a pattern or line |
-| `remove_block` | Remove a block by starting line number |
-| `replace_block` | Replace a block entirely with new text |
-| `set_basetype_rule` | Add a top-priority Show/Hide rule for one or more BaseTypes |
+The exchange `core.primary` currency governs `primaryValue`; `core.rates`
+converts it. Stash overview is aggregate public pricing, not access to a user's
+private stash. Exchange volume is not a count of listings. These types are from
+[poe.ninja's documented PoE2 public endpoints](https://poe.ninja/docs/api).

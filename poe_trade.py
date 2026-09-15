@@ -1,543 +1,406 @@
-"""PoE Trade MCP Server — search and fetch from pathofexile.com/api/trade.
+"""Anonymous, read-only PoE2 trade search and metadata with explicit failures."""
 
-General-purpose trade API wrapper for any item type, not just wands.
-
-Version: 1.0
-"""
-import asyncio
-import json
-import os
+import math
 import re
-import sys
-import time
-import urllib.request
-import urllib.error
 import urllib.parse
-from pathlib import Path
+import anyio
+from mcp.types import Tool
+from mcp_server_utils import Server, result, run_server
+from poe_lib import resolve_league
+from public_http import request_json, USER_AGENT
 
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
-
-TRADE_BASE = "https://www.pathofexile.com/api/trade"
+TRADE_BASE = "https://www.pathofexile.com/api/trade2"
+TRADE_SITE = "https://www.pathofexile.com/trade2/search/poe2/"
 HEADERS = {
-    "Content-Type": "application/json",
-    "User-Agent": "OAuth BoschAIMaster/1.0 (contact: buildtool@localhost)",
+    "User-Agent": USER_AGENT,
     "Accept": "application/json",
+    "Content-Type": "application/json",
 }
-
-# Default league — overridden by tool argument
-DEFAULT_LEAGUE = "Mirage"
-
-# GGG trade API rate limiting — see legal_considerations.md TOS section.
-# Floor: 1.5s between requests. Dynamically widened from X-Rate-Limit response
-# headers so we stay inside GGG's observed per-policy windows.
-_last_trade_request_time: float = 0.0
-_TRADE_MIN_INTERVAL = 1.5        # hard floor (seconds)
-_observed_min_interval: float = _TRADE_MIN_INTERVAL  # updated from headers
-
-NON_AFFILIATION_NOTICE = (
-    "Note: This product is not affiliated with or endorsed by Grinding Gear Games."
-)
-
-
-def _update_from_headers(headers) -> float:
-    """Parse X-Rate-Limit-* response headers and return recommended min interval.
-
-    GGG header format: 'X-Rate-Limit-Ip: 12:10:60,15:60:120'
-    Each rule is max_hits:period_secs:restriction_secs.
-    We derive an interval = period/max_hits with a 25% safety margin.
-    """
-    interval = _TRADE_MIN_INTERVAL
-    for key in ("X-Rate-Limit-Ip", "X-Rate-Limit-Account", "X-Rate-Limit-Client"):
-        try:
-            val = headers.get(key)
-        except Exception:
-            val = None
-        if not val:
-            continue
-        for rule in val.split(","):
-            parts = rule.split(":")
-            if len(parts) >= 2:
-                try:
-                    max_hits = int(parts[0])
-                    period_secs = int(parts[1])
-                    if max_hits > 0 and period_secs > 0:
-                        rule_interval = (period_secs / max_hits) * 1.25
-                        interval = max(interval, rule_interval)
-                except ValueError:
-                    pass
-    return interval
-
-
-def _rate_limit_trade():
-    """Block until the observed inter-request interval has elapsed."""
-    global _last_trade_request_time
-    interval = max(_TRADE_MIN_INTERVAL, _observed_min_interval)
-    elapsed = time.time() - _last_trade_request_time
-    if elapsed < interval:
-        time.sleep(interval - elapsed)
-    _last_trade_request_time = time.time()
+NON_AFFILIATION_NOTICE = "Not affiliated with or endorsed by Grinding Gear Games."
+app = Server("poe-trade")
 
 
 def _load_headers():
-    """Return request headers, adding POESESSID cookie from config if available."""
-    h = dict(HEADERS)
-    config_paths = [
-        Path(os.environ["POE_CONFIG_PATH"]) if "POE_CONFIG_PATH" in os.environ else None,
-        Path(__file__).parent.parent / "buildstuff" / "poe_monitor" / "config.json",
-    ]
-    config_paths = [p for p in config_paths if p]
-    for p in config_paths:
-        try:
-            cfg = json.loads(p.read_text())
-            sessid = cfg.get("poesessid", "")
-            if sessid:
-                h["Cookie"] = "POESESSID=" + sessid
-                break
-        except Exception:
-            pass
-    return h
-
-
-app = Server("poe-trade")
-print("[poe-trade] SERVER START — instant buyout ALWAYS enforced (sale_type: priced)", file=sys.stderr)
-
-MAX_RETRIES = 4
-RETRY_WAITS = [10, 20, 30]  # seconds between attempts 1-2, 2-3, 3-4
-
-
-def _post_json(url, payload):
-    """POST JSON and return response dict. Updates rate limit state from headers."""
-    global _observed_min_interval
-    _rate_limit_trade()
-    headers = _load_headers()
-    data = json.dumps(payload).encode("utf-8")
-    print("[poe-trade] POST " + url, file=sys.stderr)
-    print("[poe-trade] payload: " + json.dumps(payload)[:400], file=sys.stderr)
-    for attempt in range(MAX_RETRIES):
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                body = json.loads(resp.read())
-                _observed_min_interval = _update_from_headers(resp.headers)
-                return body
-        except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < MAX_RETRIES - 1:
-                retry_after = float(e.headers.get("Retry-After") or RETRY_WAITS[attempt])
-                print(f"[poe-trade] HTTP 429 attempt {attempt+1}, retrying in {retry_after}s", file=sys.stderr)
-                time.sleep(retry_after)
-                continue
-            raise
+    return dict(HEADERS)
 
 
 def _get_json(url):
-    """GET and return response dict. Updates rate limit state from headers."""
-    global _observed_min_interval
-    _rate_limit_trade()
-    headers = _load_headers()
-    for attempt in range(MAX_RETRIES):
-        req = urllib.request.Request(url, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                body = json.loads(resp.read())
-                _observed_min_interval = _update_from_headers(resp.headers)
-                return body
-        except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < MAX_RETRIES - 1:
-                retry_after = float(e.headers.get("Retry-After") or RETRY_WAITS[attempt])
-                time.sleep(retry_after)
-                continue
-            raise
+    return request_json(url, ttl=3600 if "/data/" in url else 0)[0]
+
+
+def _post_json(url, payload):
+    return request_json(url, payload=payload)[0]
+
+
+def _metadata(kind):
+    data = _get_json(TRADE_BASE + "/data/" + kind)
+    if not isinstance(data, dict) or not isinstance(data.get("result"), list):
+        raise ValueError(f"Invalid PoE2 {kind} metadata")
+    return data["result"]
+
+
+def _get_stats():
+    return [
+        {"id": e["id"], "text": e["text"], "type": g.get("label", "")}
+        for g in _metadata("stats")
+        for e in g.get("entries", [])
+    ]
+
+
+def _filter_options(group, name):
+    for g in _metadata("filters"):
+        if g["id"] == group:
+            for f in g["filters"]:
+                if f["id"] == name:
+                    return f.get("option", {}).get("options", [])
+    raise ValueError(f"PoE2 source no longer exposes {group}.{name}")
+
+
+def _validate_search_metadata(args):
+    league = resolve_league(args.get("league"))
+    leagues = [l["id"] for l in _metadata("leagues") if l.get("realm") == "poe2"]
+    if league not in leagues:
+        raise ValueError(f"League {league!r} is not listed by the PoE2 trade source")
+    for key, group, field in [
+        ("category", "type_filters", "category"),
+        ("rarity", "type_filters", "rarity"),
+    ]:
+        value = args.get(key)
+        if (
+            value
+            and value != "any"
+            and value not in [o["id"] for o in _filter_options(group, field)]
+        ):
+            raise ValueError(f"Unknown PoE2 {key}: {value}; use get_trade_filters")
+    if args.get("stats"):
+        known = {s["id"] for s in _get_stats()}
+        unknown = [s["id"] for s in args["stats"] if s["id"] not in known]
+        if unknown:
+            raise ValueError(f"Unknown PoE2 stat IDs: {unknown}")
+
+
+def _range(value, label):
+    out = {}
+    for key in ("min", "max"):
+        if key in value:
+            number = value[key]
+            if (
+                isinstance(number, bool)
+                or not isinstance(number, (int, float))
+                or not math.isfinite(number)
+            ):
+                raise ValueError(f"{label}.{key} must be a finite number")
+            out[key] = number
+    if "min" in out and "max" in out and out["min"] > out["max"]:
+        raise ValueError(f"{label}: min exceeds max")
+    return out
+
+
+def _build_search_payload(arguments):
+    if "min_links" in arguments:
+        raise ValueError("PoE1 linked socket filters are unsupported in PoE2")
+    stats = arguments.get("stats", [])
+    if not isinstance(stats, list):
+        raise ValueError("stats must be an array of PoE2 stat filters")
+    instant = arguments.get("instant_buyout", False)
+    status = (
+        "securable"
+        if instant
+        else ("online" if arguments.get("online_only", True) else "any")
+    )
+    query = {
+        "status": {"option": status},
+        "stats": [{"type": "and", "filters": []}],
+        "filters": {},
+    }
+    for key, target in [("name", "name"), ("base_type", "type")]:
+        if arguments.get(key):
+            query[target] = arguments[key]
+    for stat in stats:
+        if not isinstance(stat, dict) or not stat.get("id"):
+            raise ValueError("Every stat requires an id")
+        query["stats"][0]["filters"].append(
+            {"id": stat["id"], "disabled": False, "value": _range(stat, "stat")}
+        )
+    type_filters = {
+        key: {"option": arguments[key]}
+        for key in ("category", "rarity")
+        if arguments.get(key) and arguments[key] != "any"
+    }
+    if type_filters:
+        query["filters"]["type_filters"] = {"filters": type_filters}
+    if "max_level" in arguments:
+        query["filters"]["req_filters"] = {
+            "filters": {"lvl": {"max": arguments["max_level"]}}
+        }
+    price = _range(
+        {
+            key: arguments["%s_price" % key]
+            for key in ("min", "max")
+            if "%s_price" % key in arguments
+        },
+        "price",
+    )
+    if any(v < 0 for v in price.values()):
+        raise ValueError("Price cannot be negative")
+    # The metadata null option denotes omission; sending JSON null is HTTP 400.
+    trade = {}
+    if price:
+        currency = arguments.get("price_currency", "divine")
+        if currency not in ("divine", "exalted", "chaos"):
+            raise ValueError("Supported price currencies: divine, exalted, chaos")
+        trade["price"] = {**price, "option": currency}
+    if arguments.get("account"):
+        trade["account"] = {"input": arguments["account"]}
+    query["filters"]["trade_filters"] = {"filters": trade}
+    return {"query": query, "sort": {"price": "asc"}}
+
+
+def _search(args):
+    payload = _build_search_payload(args)
+    _validate_search_metadata(args)
+    league = resolve_league(args.get("league"))
+    encoded = urllib.parse.quote(league, safe="")
+    data = _post_json(TRADE_BASE + "/search/poe2/" + encoded, payload)
+    query_id = data.get("id")
+    if (
+        not isinstance(query_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9_-]+", query_id)
+        or not isinstance(data.get("total"), int)
+    ):
+        raise ValueError("PoE2 trade search response lacks a valid query id/total")
+    return {
+        "game": "poe2",
+        "league": league,
+        "total": data["total"],
+        "query_id": query_id,
+        "trade_url": TRADE_SITE + encoded + "/" + query_id,
+        "notice": NON_AFFILIATION_NOTICE,
+    }
+
+
+def _normalize_stat(text):
+    return re.sub(r"\s+", " ", re.sub(r"\+?-?\d+(?:\.\d+)?", "#", text.lower())).strip()
+
+
+def mod_text_to_stat_id(text, is_local=False):
+    numbers = re.findall(r"[-+]?\d+(?:\.\d+)?", text)
+    if len(numbers) != 1:
+        raise ValueError(
+            "Mod text must contain one numeric value; use explicit stat IDs for ranges/multiple values"
+        )
+    pattern = _normalize_stat(text)
+    if is_local:
+        pattern += " (local)"
+    matches = [
+        s
+        for s in _get_stats()
+        if s["id"].startswith("explicit.") and _normalize_stat(s["text"]) == pattern
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "Mod text has no unique PoE2 stat mapping; use get_stat_ids and search_trade"
+        )
+    return matches[0]["id"], float(numbers[0])
+
+
+def _parse_listing(row):
+    item, listing = row.get("item", {}), row.get("listing", {})
+    price = listing.get("price", {})
+    return {
+        "id": row.get("id"),
+        "name": item.get("name"),
+        "base_type": item.get("typeLine"),
+        "ilvl": item.get("ilvl"),
+        "price_amount": price.get("amount"),
+        "price_currency": price.get("currency"),
+        "implicit_mods": item.get("implicitMods", []),
+        "explicit_mods": item.get("explicitMods", []),
+        "corrupted": item.get("corrupted", False),
+    }
+
+
+STRING = {"type": "string", "minLength": 1}
+LIMIT = {"type": "integer", "minimum": 1, "maximum": 100}
+SEARCH = {
+    "league": {
+        **STRING,
+        "description": "Exact PoE2 league or POE_LEAGUE; never guessed.",
+    },
+    "category": {**STRING, "description": "PoE2 category id from get_trade_filters."},
+    "rarity": {**STRING, "description": "Rarity id from get_trade_filters."},
+    "name": STRING,
+    "base_type": STRING,
+    "stats": {
+        "type": "array",
+        "maxItems": 100,
+        "items": {
+            "type": "object",
+            "properties": {
+                "id": STRING,
+                "min": {"type": "number"},
+                "max": {"type": "number"},
+            },
+            "required": ["id"],
+            "additionalProperties": False,
+        },
+    },
+    "min_price": {"type": "number", "minimum": 0},
+    "max_price": {"type": "number", "minimum": 0},
+    "price_currency": {
+        "type": "string",
+        "enum": ["divine", "exalted", "chaos"],
+        "default": "divine",
+    },
+    "max_level": {"type": "integer", "minimum": 1, "maximum": 100},
+    "online_only": {"type": "boolean", "default": True},
+    "instant_buyout": {
+        "type": "boolean",
+        "default": False,
+        "description": "Filter to securable listings; performs no purchase.",
+    },
+    "account": STRING,
+}
+
+
+def _tool(name, description, properties, required=()):
+    return Tool(
+        name=name,
+        description=description,
+        inputSchema={
+            "type": "object",
+            "properties": properties,
+            "required": list(required),
+            "additionalProperties": False,
+        },
+    )
 
 
 TOOLS = [
-    Tool(
-        name="search_trade",
-        description=(
-            "⚠️ GGG TOS (confirm once per session): hits pathofexile.com/api/trade. "
-            "Warn user and get explicit confirmation the first time this is called in a session. "
-            "Search the PoE trade site for items matching filters. "
-            "Returns a clickable trade URL and total listing count — does NOT fetch listing "
-            "details (ExileExchange pattern). User opens the URL to browse results."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "league": {
-                    "type": "string",
-                    "description": "League name (default: " + DEFAULT_LEAGUE + ").",
-                },
-                "category": {
-                    "type": "string",
-                    "description": (
-                        "Item category filter. Examples: 'weapon.wand', 'weapon.staff', "
-                        "'armour.body', 'armour.helmet', 'armour.boots', 'armour.gloves', "
-                        "'armour.shield', 'accessory.ring', 'accessory.amulet', 'accessory.belt', "
-                        "'jewel', 'gem'. Optional."
-                    ),
-                },
-                "rarity": {
-                    "type": "string",
-                    "description": "Rarity filter: 'nonunique', 'unique', 'any' (default: 'any').",
-                },
-                "name": {
-                    "type": "string",
-                    "description": "Item name to search for (for uniques). Optional.",
-                },
-                "base_type": {
-                    "type": "string",
-                    "description": "Base type filter (e.g., 'Opal Wand', 'Astral Plate'). Optional.",
-                },
-                "stats": {
-                    "type": "array",
-                    "description": (
-                        "Stat filters. Each entry: {id, min, max}. "
-                        "Common stat IDs: "
-                        "'pseudo.pseudo_total_life' (total life), "
-                        "'pseudo.pseudo_total_elemental_resistance' (total ele res), "
-                        "'explicit.stat_210067635' (local attack speed), "
-                        "'explicit.stat_2974417149' (spell damage), "
-                        "'explicit.stat_3336890334' (local lightning dmg), "
-                        "'explicit.stat_1940865751' (local phys dmg). "
-                        "Use get_stat_ids tool to find specific stat IDs."
-                    ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "string"},
-                            "min": {"type": "number"},
-                            "max": {"type": "number"},
-                        },
-                        "required": ["id"],
+    _tool(
+        "search_trade",
+        "Anonymous PoE2 read-only trade search; returns a URL and count. Public API access may be denied.",
+        SEARCH,
+    ),
+    _tool(
+        "get_stat_ids",
+        "Find current PoE2 stat ids; cached metadata, no league guessing.",
+        {"query": STRING, "limit": LIMIT},
+        ["query"],
+    ),
+    _tool(
+        "get_trade_filters",
+        "Get current PoE2 categories, rarity and other supported filters.",
+        {},
+    ),
+    _tool(
+        "get_trade_leagues",
+        "Get current official trade leagues for the poe2 realm.",
+        {},
+    ),
+    _tool(
+        "search_by_item_mods",
+        "Map unambiguous single-number mod texts to PoE2 stat ids. Unmatched mods are errors.",
+        {
+            **{
+                k: v
+                for k, v in SEARCH.items()
+                if k not in ("stats", "name", "category")
+            },
+            "unique_name": STRING,
+            "item_category": STRING,
+            "mods": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 30,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": STRING,
+                        "is_local": {"type": "boolean"},
+                        "min_pct": {"type": "number", "minimum": 0, "maximum": 1},
                     },
-                },
-                "min_price": {
-                    "type": "number",
-                    "description": "Minimum price in chaos orbs. Optional. Set this when searching for non-trivial items to prevent cheap listings from selling before the fetch completes.",
-                },
-                "max_price": {
-                    "type": "number",
-                    "description": "Maximum price in chaos orbs. Optional.",
-                },
-                "max_level": {
-                    "type": "integer",
-                    "description": "Maximum level requirement. Optional.",
-                },
-                "instant_buyout": {
-                    "type": "boolean",
-                    "description": "Only show priced (instant buyout) listings (default true when max_price is set).",
-                },
-                "online_only": {
-                    "type": "boolean",
-                    "description": "Only show online sellers (default true).",
-                },
-                "account": {
-                    "type": "string",
-                    "description": "Filter by seller account name (e.g., 'buddies1296#3898'). Optional.",
-                },
-                "min_links": {
-                    "type": "number",
-                    "description": "Minimum number of linked sockets (e.g. 6 for six-linked). Optional.",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results to fetch (default 10, max 20).",
+                    "required": ["text"],
+                    "additionalProperties": False,
                 },
             },
         },
     ),
-    Tool(
-        name="get_stat_ids",
-        description=(
-            "Search for trade stat filter IDs by keyword. "
-            "Use this to find the correct stat ID for search_trade filters. "
-            "Returns matching stat IDs with their display text."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Keyword to search for (e.g., 'attack speed', 'fire resistance', 'spell damage').",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results (default 10).",
-                },
-            },
-            "required": ["query"],
-        },
-    ),
-    Tool(
-        name="search_by_item_mods",
-        description=(
-            "⚠️ GGG TOS (confirm once per session): hits pathofexile.com/api/trade. "
-            "Warn user and get explicit confirmation the first time this is called in a session. "
-            "Search trade for an item by its mod texts — no stat IDs needed. "
-            "Pass mod lines as human-readable text (e.g. '+92 to maximum Life', "
-            "'17% increased Attack Speed'). Handles local weapon mods automatically. "
-            "For uniques pass unique_name instead of mods. "
-            "Returns a clickable trade URL — does NOT fetch listing details (ExileExchange pattern)."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "mods": {
-                    "type": "array",
-                    "description": "List of mod objects. Each: {text: str, is_local: bool (default false), min_pct: float (default 0.7)}.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "text": {"type": "string"},
-                            "is_local": {"type": "boolean"},
-                            "min_pct": {"type": "number"},
-                        },
-                        "required": ["text"],
-                    },
-                },
-                "item_category": {
-                    "type": "string",
-                    "description": "Trade category, e.g. 'weapon.wand', 'armour.chest', 'accessory.ring'.",
-                },
-                "unique_name": {
-                    "type": "string",
-                    "description": "For unique items: search by name instead of mods.",
-                },
-                "league": {"type": "string"},
-                "limit": {"type": "integer"},
+    _tool(
+        "fetch_listing",
+        "Read up to 10 explicitly supplied PoE2 listing IDs. No seller contact or purchase.",
+        {
+            "query_id": {**STRING, "pattern": "^[A-Za-z0-9_-]+$"},
+            "listing_ids": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 10,
+                "items": {**STRING, "pattern": "^[A-Za-z0-9_-]+$"},
             },
         },
-    ),
-    Tool(
-        name="fetch_listing",
-        description=(
-            "⚠️ GGG TOS (confirm once per session): hits pathofexile.com/api/trade. "
-            "Fetch detailed info for specific trade listing IDs (from a previous search). "
-            "Use sparingly — prefer opening the trade URL in a browser instead."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "query_id": {
-                    "type": "string",
-                    "description": "The query ID from a previous search_trade result.",
-                },
-                "listing_ids": {
-                    "type": "string",
-                    "description": "Comma-separated listing IDs to fetch (max 10), e.g. 'id1,id2'.",
-                },
-            },
-            "required": ["query_id", "listing_ids"],
-        },
+        ["query_id", "listing_ids"],
     ),
 ]
 
 
-# Cache stats data (fetched once)
-_stats_cache = None
-
-
-def _get_stats():
-    global _stats_cache
-    if _stats_cache is not None:
-        return _stats_cache
-    data = _get_json(TRADE_BASE + "/data/stats")
-    all_stats = []
-    for group in data.get("result", []):
-        for entry in group.get("entries", []):
-            all_stats.append({
-                "id": entry.get("id", ""),
-                "text": entry.get("text", ""),
-                "type": entry.get("type", group.get("label", "")),
-            })
-    _stats_cache = all_stats
-    return all_stats
-
-
-# ─── Mod-text → stat-ID lookup (shared with item roller) ────────────────────
-
-_stats_index_by_pattern = None
-
-
-def _normalize_stat(text):
-    """Normalize mod/stat text for fuzzy matching: numbers→#, lowercase, strip +."""
-    text = text.lower()
-    text = re.sub(r'\d+(?:\.\d+)?', '#', text)
-    text = re.sub(r'#(?:\s*to\s*)#', '#', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    text = text.lstrip('+')
-    return text
-
-
-def _build_stats_index():
-    """Build and cache a pattern→[(stat_id, label)] index from the trade stats API."""
-    global _stats_index_by_pattern
-    if _stats_index_by_pattern is not None:
-        return _stats_index_by_pattern
-    try:
-        data = _get_json(TRADE_BASE + "/data/stats")
-        idx = {}
-        for group in data.get("result", []):
-            label = group.get("label", "")
-            if label not in ("Explicit", "Pseudo", "Delve", "Fractured", "Implicit"):
-                continue
-            for entry in group.get("entries", []):
-                sid = entry.get("id", "")
-                text = entry.get("text", "")
-                if not sid or not text:
-                    continue
-                pat = _normalize_stat(text)
-                idx.setdefault(pat, []).append((sid, label))
-        _stats_index_by_pattern = idx
-    except Exception:
-        _stats_index_by_pattern = {}
-    return _stats_index_by_pattern
-
-
-def mod_text_to_stat_id(mod_text, is_local=False):
-    """Return (stat_id, numeric_value) for a rolled mod text, or None.
-    is_local: if True, try '... (local)' pattern first (weapon local mods)."""
-    idx = _build_stats_index()
-    nums = re.findall(r'\d+(?:\.\d+)?', mod_text)
-    value = float(nums[-1]) if nums else 0
-    pat = _normalize_stat(mod_text)
-
-    if is_local:
-        candidates = idx.get(pat + " (local)", [])
-        for sid, label in candidates:
-            if label == "Explicit":
-                return sid, value
-        if candidates:
-            return candidates[0][0], value
-
-    candidates = idx.get(pat, [])
-    for sid, label in candidates:
-        if label == "Explicit":
-            return sid, value
-    if candidates:
-        return candidates[0][0], value
-    return None
-
-
-def _build_search_payload(arguments):
-    """Build trade API search payload from tool arguments."""
-    query = {}
-
-    # Status — always "securable" = Travel to Hideout / Instant Buyout.
-    # This is what drives the "Travel to Hideout" button on the trade site.
-    query["status"] = {"option": "securable"}
-
-    # Name / type
-    if arguments.get("name"):
-        query["name"] = arguments["name"]
-    if arguments.get("base_type"):
-        query["type"] = arguments["base_type"]
-
-    # Stats — parse defensively in case MCP delivers as JSON string
-    stats_arg = arguments.get("stats", [])
-    if isinstance(stats_arg, str):
-        try:
-            stats_arg = json.loads(stats_arg)
-        except Exception:
-            stats_arg = []
-    print("[poe-trade] stats_arg type=" + type(stats_arg).__name__ + " len=" + str(len(stats_arg)), file=sys.stderr)
-    if stats_arg:
-        filters = []
-        for s in stats_arg:
-            f = {"id": s["id"], "disabled": False}
-            value = {}
-            if "min" in s:
-                value["min"] = float(s["min"])
-            if "max" in s:
-                value["max"] = float(s["max"])
-            if value:
-                f["value"] = value
-            filters.append(f)
-        query["stats"] = [{"type": "and", "filters": filters}]
-
-    # Type/category filters
-    type_filters = {}
-    if arguments.get("category"):
-        type_filters["category"] = {"option": arguments["category"]}
-    if arguments.get("rarity") and arguments["rarity"] != "any":
-        type_filters["rarity"] = {"option": arguments["rarity"]}
-    if type_filters:
-        query.setdefault("filters", {})["type_filters"] = {"filters": type_filters}
-
-    # Req filters
-    if arguments.get("max_level"):
-        query.setdefault("filters", {}).setdefault("req_filters", {})["filters"] = {
-            "lvl": {"max": arguments["max_level"]}
+def _dispatch(name, args):
+    if name == "get_trade_filters":
+        return {"game": "poe2", "filters": _metadata("filters")}
+    if name == "get_trade_leagues":
+        return {
+            "game": "poe2",
+            "leagues": [l for l in _metadata("leagues") if l.get("realm") == "poe2"],
         }
-
-    # Price + sale_type filters (both go in trade_filters.filters together)
-    # ALWAYS enforce priced listings — filters out unpriced/negotiate listings.
-    # Note: PoE1 trade API only supports "priced" — the Instant Buyout vs In Person
-    # distinction shown in the trade site UI is not exposed in the API.
-    trade_f = {"sale_type": {"option": "priced"}}
-    price_f = {}
-    if arguments.get("min_price"):
-        price_f["min"] = float(arguments["min_price"])
-    if arguments.get("max_price"):
-        price_f["max"] = float(arguments["max_price"])
-    if price_f:
-        price_f["option"] = "chaos"
-        trade_f["price"] = price_f
-    query.setdefault("filters", {}).setdefault("trade_filters", {})["filters"] = trade_f
-    print("[poe-trade] ENFORCING instant_buyout — trade_filters=" + str(trade_f), file=sys.stderr)
-
-    # Socket link filter
-    if arguments.get("min_links"):
-        query.setdefault("filters", {}).setdefault("socket_filters", {})["filters"] = {
-            "links": {"min": int(arguments["min_links"])}
-        }
-
-    # Account filter
-    if arguments.get("account"):
-        query.setdefault("filters", {}).setdefault("trade_filters", {}).setdefault("filters", {})["account"] = {
-            "input": arguments["account"]
-        }
-
-    return {"query": query, "sort": {"price": "asc"}}
-
-
-def _parse_listing(item_data):
-    """Parse a trade fetch result into a clean dict."""
-    listing = item_data.get("listing", {})
-    price = listing.get("price", {})
-    it = item_data.get("item", {})
-
-    result = {
-        "id": item_data.get("id", ""),
-        "name": (it.get("name", "") + " " + it.get("typeLine", "")).strip(),
-        "base_type": it.get("typeLine", ""),
-        "ilvl": it.get("ilvl", 0),
-        "price_amount": price.get("amount", 0),
-        "price_currency": price.get("currency", "?"),
-        "account": listing.get("account", {}).get("name", ""),
-        "implicit_mods": it.get("implicitMods", []),
-        "explicit_mods": it.get("explicitMods", []),
-        "crafted_mods": it.get("craftedMods", []),
-        "corrupted": it.get("corrupted", False),
+    if name == "get_stat_ids":
+        q = args["query"].casefold()
+        return [
+            s
+            for s in _get_stats()
+            if q in s["text"].casefold() or q in s["id"].casefold()
+        ][: args.get("limit", 10)]
+    if name == "search_by_item_mods":
+        args = dict(args)
+        if args.get("unique_name") and args.get("mods"):
+            raise ValueError("Supply unique_name or mods, not both")
+        if args.get("unique_name"):
+            args["name"] = args.pop("unique_name")
+        else:
+            if not args.get("mods"):
+                raise ValueError("Supply mods or unique_name")
+            stats = []
+            for mod in args.pop("mods"):
+                sid, value = mod_text_to_stat_id(
+                    mod["text"], mod.get("is_local", False)
+                )
+                if value < 0:
+                    raise ValueError(
+                        "Negative mods need an explicit min/max stat filter"
+                    )
+                if any(s["id"] == sid for s in stats):
+                    raise ValueError("Duplicate mod stat id; use search_trade")
+                stats.append({"id": sid, "min": value * mod.get("min_pct", 0.7)})
+            args["stats"] = stats
+            args.setdefault("rarity", "rare")
+        if args.get("item_category"):
+            args["category"] = args.pop("item_category")
+        return _search(args)
+    if name == "search_trade":
+        return _search(args)
+    url = (
+        TRADE_BASE
+        + "/fetch/"
+        + ",".join(args["listing_ids"])
+        + "?"
+        + urllib.parse.urlencode({"query": args["query_id"], "realm": "poe2"})
+    )
+    data = _get_json(url)
+    if not isinstance(data.get("result"), list):
+        raise ValueError("Invalid PoE2 listing response")
+    return {
+        "results": [_parse_listing(r) for r in data["result"] if r is not None],
+        "unavailable_listings": sum(r is None for r in data["result"]),
+        "notice": NON_AFFILIATION_NOTICE,
     }
-
-    for req in it.get("requirements", []):
-        if req.get("name") == "Level":
-            try:
-                result["level_req"] = int(req["values"][0][0])
-            except (IndexError, ValueError):
-                pass
-
-    sockets = it.get("sockets", [])
-    if sockets:
-        groups = {}
-        for s in sockets:
-            g = s.get("group", 0)
-            groups.setdefault(g, []).append(s.get("sColour", "?"))
-        result["sockets"] = "-".join(["".join(v) for v in groups.values()])
-
-    return result
 
 
 @app.list_tools()
@@ -546,129 +409,9 @@ async def list_tools():
 
 
 @app.call_tool()
-async def call_tool(name: str, arguments: dict):
-    try:
-        if name == "search_trade":
-            # URL-return pattern (ExileExchange): one search POST → trade URL.
-            # We do NOT fetch listings. User opens the URL to browse results.
-            # See legal_considerations.md TOS section.
-            league = arguments.get("league", DEFAULT_LEAGUE)
+async def call_tool(name, arguments):
+    return result(await anyio.to_thread.run_sync(_dispatch, name, arguments))
 
-            payload = _build_search_payload(arguments)
-            url = TRADE_BASE + "/search/" + urllib.parse.quote(league)
-            data = _post_json(url, payload)
-
-            query_id = data.get("id", "")
-            total = data.get("total", 0)
-            trade_url = "https://www.pathofexile.com/trade/search/" + urllib.parse.quote(league) + "/" + query_id
-
-            result = {
-                "total": total,
-                "trade_url": trade_url,
-                "query_id": query_id,
-                "notice": NON_AFFILIATION_NOTICE,
-            }
-            return [TextContent(type="text", text=json.dumps(result, indent=2))]
-
-        elif name == "get_stat_ids":
-            q = arguments["query"].lower()
-            limit = arguments.get("limit", 10)
-            stats = _get_stats()
-            matches = [s for s in stats if q in s["text"].lower() or q in s["id"].lower()][:limit]
-            return [TextContent(type="text", text=json.dumps(matches, indent=2))]
-
-        elif name == "search_by_item_mods":
-            league = arguments.get("league", DEFAULT_LEAGUE)
-            limit = min(arguments.get("limit", 10), 20)
-            trade_f = {"sale_type": {"option": "priced"}}
-
-            if arguments.get("unique_name"):
-                query = {
-                    "status": {"option": "securable"},
-                    "name": arguments["unique_name"],
-                    "filters": {"trade_filters": {"filters": trade_f}},
-                }
-            else:
-                stat_filters = []
-                seen_sids = set()
-                for m in arguments.get("mods", []):
-                    text = m.get("text", "")
-                    is_local = m.get("is_local", False)
-                    min_pct = m.get("min_pct", 0.7)
-                    res = mod_text_to_stat_id(text, is_local=is_local)
-                    if res:
-                        sid, val = res
-                        if sid not in seen_sids:
-                            seen_sids.add(sid)
-                            min_val = round(val * min_pct)
-                            if min_val > 0:
-                                stat_filters.append({"id": sid, "disabled": False, "value": {"min": min_val}})
-
-                type_f = {"rarity": {"option": "rare"}}
-                if arguments.get("item_category"):
-                    type_f["category"] = {"option": arguments["item_category"]}
-
-                query = {
-                    "status": {"option": "securable"},
-                    "filters": {
-                        "type_filters": {"filters": type_f},
-                        "trade_filters": {"filters": trade_f},
-                    },
-                }
-                if stat_filters:
-                    query["stats"] = [{"type": "and", "filters": stat_filters}]
-
-            # URL-return pattern (ExileExchange): one search POST → trade URL.
-            # We do NOT fetch listings. User opens the URL to browse results.
-            # See legal_considerations.md TOS section.
-            payload = {"query": query, "sort": {"price": "asc"}}
-            url = TRADE_BASE + "/search/" + urllib.parse.quote(league)
-            data = _post_json(url, payload)
-            query_id = data.get("id", "")
-            total = data.get("total", 0)
-            trade_url = "https://www.pathofexile.com/trade/search/" + urllib.parse.quote(league) + "/" + query_id
-
-            return [TextContent(type="text", text=json.dumps({
-                "total": total,
-                "trade_url": trade_url,
-                "query_id": query_id,
-                "notice": NON_AFFILIATION_NOTICE,
-            }, indent=2))]
-
-        elif name == "fetch_listing":
-            query_id = arguments["query_id"]
-            listing_ids_raw = arguments["listing_ids"]
-            if isinstance(listing_ids_raw, list):
-                listing_ids = listing_ids_raw
-            else:
-                # Try JSON parse first, then comma-split
-                import json as _json
-                try:
-                    listing_ids = _json.loads(listing_ids_raw)
-                    if not isinstance(listing_ids, list):
-                        listing_ids = [str(listing_ids)]
-                except Exception:
-                    listing_ids = [s.strip() for s in listing_ids_raw.split(",") if s.strip()]
-            listing_ids = listing_ids[:10]
-            ids_str = ",".join(listing_ids)
-            data = _get_json(TRADE_BASE + "/fetch/" + ids_str + "?query=" + query_id)
-            listings = [_parse_listing(r) for r in data.get("result", [])]
-            return [TextContent(type="text", text=json.dumps({
-                "results": listings,
-                "notice": NON_AFFILIATION_NOTICE,
-            }, indent=2))]
-
-        else:
-            return [TextContent(type="text", text="Unknown tool: " + name)]
-
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:500] if hasattr(e, "read") else ""
-        return [TextContent(type="text", text="HTTP " + str(e.code) + ": " + body)]
-    except Exception as e:
-        return [TextContent(type="text", text="Error: " + type(e).__name__ + ": " + str(e))]
-
-
-from mcp_server_utils import run_server
 
 if __name__ == "__main__":
-    run_server(app, port=8483, name="poe-trade")
+    run_server(app)

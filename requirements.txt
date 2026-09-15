@@ -1,4 +1,5 @@
-mcp
-anyio
-git+https://github.com/brather1ng/PyPoE.git
-git+https://github.com/brather1ng/RePoE.git
+# Supported upstream protocol API; do not upgrade to MCP 2.x.
+mcp>=1.26,<2
+anyio>=4.5,<5
+jsonschema>=4.20,<5
+defusedxml>=0.7.1,<1

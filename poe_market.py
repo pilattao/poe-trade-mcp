@@ -1,132 +1,137 @@
-"""PoE Market MCP Server — exposes price_history.db via MCP.
+"""Query real local PoE2 price observations; explicit refresh uses public ninja."""
 
-Wraps price_db.py functions for querying market data collected by trend_watcher.py.
-
-Version: 1.0
-"""
-import asyncio
-import json
-import sys
-from pathlib import Path
-
-# price_db lives alongside this server (or in buildstuff)
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import price_db
-
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+import anyio
+from mcp.types import Tool
+from mcp_server_utils import Server, result, run_server
+from poe_lib import resolve_league
+from price_db import PriceCache
+from poe_pricer import CATEGORIES, fetch_category
 
 app = Server("poe-market")
+LEAGUE = {
+    "type": "string",
+    "minLength": 1,
+    "description": "Exact PoE2 league or POE_LEAGUE; no auto-selection.",
+}
+NAME = {"type": "string", "minLength": 1}
+LIMIT = {"type": "integer", "minimum": 1, "maximum": 200}
+
+
+def _tool(name, description, properties=None, required=()):
+    return Tool(
+        name=name,
+        description=description,
+        inputSchema={
+            "type": "object",
+            "properties": {"league": LEAGUE, **(properties or {})},
+            "required": list(required),
+            "additionalProperties": False,
+        },
+    )
+
 
 TOOLS = [
-    Tool(
-        name="get_price",
-        description="Get the latest price for a specific item. Returns chaos value and category.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Item name to look up (exact match, case-insensitive).",
-                },
-            },
-            "required": ["name"],
-        },
+    _tool(
+        "get_price",
+        "Get exact-name prices, preserving all variants, from the local PoE2 cache.",
+        {"name": NAME},
+        ["name"],
     ),
-    Tool(
-        name="get_price_history",
-        description="Get the full price history for an item (all snapshots). Useful for seeing price trajectory over time.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Item name (exact match).",
-                },
-            },
-            "required": ["name"],
-        },
+    _tool(
+        "get_price_history",
+        "Local observations for an exact name; includes category, currency, variant and fetch times.",
+        {"name": NAME},
+        ["name"],
     ),
-    Tool(
-        name="search_items",
-        description="Search for items by name substring. Returns latest price for each match.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search term (substring match).",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results (default 20).",
-                },
-            },
-            "required": ["query"],
-        },
+    _tool(
+        "search_items",
+        "Search latest cached PoE2 category snapshots by literal name substring.",
+        {"query": NAME, "limit": LIMIT},
+        ["query"],
     ),
-    Tool(
-        name="get_risers",
-        description="Get items with the biggest positive price increase (% change) across all snapshots.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "min_snapshots": {
-                    "type": "integer",
-                    "description": "Minimum number of price snapshots required (default 3). Higher = more reliable trends.",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results (default 25).",
-                },
+    *[
+        _tool(
+            name,
+            description,
+            {
+                "min_snapshots": {"type": "integer", "minimum": 2},
+                "limit": LIMIT,
                 "min_price": {
                     "type": "number",
-                    "description": "Minimum current price in chaos to include (default 0). Filters out junk.",
+                    "minimum": 0,
+                    "description": "Minimum price in each result’s reference currency.",
                 },
             },
-        },
+        )
+        for name, description in [
+            (
+                "get_risers",
+                "Positive changes across real observations of the same league/item/variant/currency.",
+            ),
+            (
+                "get_fallers",
+                "Negative changes across real observations of the same league/item/variant/currency.",
+            ),
+            (
+                "get_movers",
+                "Largest absolute percentage changes; mixed currencies are never summed.",
+            ),
+        ]
+    ],
+    _tool(
+        "snapshot_status",
+        "Show cache coverage and observation times for the exact PoE2 league.",
     ),
-    Tool(
-        name="get_fallers",
-        description="Get items with the biggest negative price drop (% change) across all snapshots.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "min_snapshots": {
-                    "type": "integer",
-                    "description": "Minimum snapshots (default 3).",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results (default 25).",
-                },
-            },
-        },
-    ),
-    Tool(
-        name="get_movers",
-        description="Get items with the biggest absolute price movement (up or down). Good for finding volatile items.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "min_snapshots": {
-                    "type": "integer",
-                    "description": "Minimum snapshots (default 3).",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results (default 25).",
-                },
-            },
-        },
-    ),
-    Tool(
-        name="snapshot_status",
-        description="Get info about the price database: total snapshots, latest fetch time, total items tracked.",
-        inputSchema={"type": "object", "properties": {}},
+    _tool(
+        "refresh_prices",
+        "Fetch one public PoE2 category and persist a real snapshot; respects hourly HTTP cache.",
+        {"category": {"type": "string", "enum": CATEGORIES}},
+        ["category"],
     ),
 ]
+
+
+def _dispatch(name, args):
+    league = resolve_league(args.get("league"))
+    db = PriceCache()
+    if name == "snapshot_status":
+        return db.status(league)
+    if name == "refresh_prices":
+        rows = fetch_category(league, args["category"])
+        return {
+            "league": league,
+            "category": args["category"],
+            "items": len(rows),
+            "fetched_at": rows[0]["fetched_at"] if rows else None,
+        }
+    if db.status(league)["total_snapshots"] == 0:
+        raise ValueError(
+            "No PoE2 price observations for this league. Call refresh_prices with an explicit category first."
+        )
+    if name == "get_price":
+        rows = [
+            r
+            for r in db.search(league, args["name"], limit=100000)
+            if r["name"].casefold() == args["name"].casefold()
+        ]
+        if not rows:
+            raise ValueError(
+                "Exact item name is absent from the cached categories; refresh the relevant category"
+            )
+        return {"results": rows}
+    if name == "get_price_history":
+        return {"results": db.history(league, args["name"])}
+    if name == "search_items":
+        return {"results": db.search(league, args["query"], args.get("limit", 20))}
+    return {
+        "results": db.movers(
+            league,
+            args.get("min_snapshots", 3),
+            args.get("limit", 25),
+            {"get_risers": "up", "get_fallers": "down", "get_movers": "both"}[name],
+            args.get("min_price", 0),
+        )
+    }
 
 
 @app.list_tools()
@@ -135,80 +140,9 @@ async def list_tools():
 
 
 @app.call_tool()
-async def call_tool(name: str, arguments: dict):
-    try:
-        if name == "get_price":
-            item_name = arguments["name"]
-            results = price_db.search_items(item_name, limit=10)
-            # Try exact match first
-            exact = [r for r in results if r["name"].lower() == item_name.lower()]
-            if exact:
-                return [TextContent(type="text", text=json.dumps(exact[0], indent=2))]
-            if results:
-                return [TextContent(type="text", text=json.dumps(results[0], indent=2))]
-            return [TextContent(type="text", text=f"No item found matching '{item_name}'")]
+async def call_tool(name, arguments):
+    return result(await anyio.to_thread.run_sync(_dispatch, name, arguments))
 
-        elif name == "get_price_history":
-            history = price_db.get_history(arguments["name"])
-            if not history:
-                # Try case-insensitive search
-                matches = price_db.search_items(arguments["name"], limit=1)
-                if matches:
-                    history = price_db.get_history(matches[0]["name"])
-            if not history:
-                return [TextContent(type="text", text=f"No history for '{arguments['name']}'")]
-            return [TextContent(type="text", text=json.dumps(history, indent=2))]
-
-        elif name == "search_items":
-            limit = arguments.get("limit", 20)
-            results = price_db.search_items(arguments["query"], limit=limit)
-            return [TextContent(type="text", text=json.dumps(results, indent=2))]
-
-        elif name == "get_risers":
-            min_snaps = arguments.get("min_snapshots", 3)
-            limit = arguments.get("limit", 25)
-            min_price = arguments.get("min_price", 0)
-            results = price_db.get_risers(min_snaps=min_snaps, limit=limit * 2)
-            if min_price > 0:
-                results = [r for r in results if r["last_price"] >= min_price][:limit]
-            else:
-                results = results[:limit]
-            return [TextContent(type="text", text=json.dumps(results, indent=2))]
-
-        elif name == "get_fallers":
-            min_snaps = arguments.get("min_snapshots", 3)
-            limit = arguments.get("limit", 25)
-            results = price_db.get_fallers(min_snaps=min_snaps, limit=limit)
-            return [TextContent(type="text", text=json.dumps(results, indent=2))]
-
-        elif name == "get_movers":
-            min_snaps = arguments.get("min_snapshots", 3)
-            limit = arguments.get("limit", 25)
-            results = price_db.get_movers(min_snaps=min_snaps, limit=limit)
-            return [TextContent(type="text", text=json.dumps(results, indent=2))]
-
-        elif name == "snapshot_status":
-            snap_count = price_db.snapshot_count()
-            times = price_db.get_snapshot_times()
-            latest = times[0] if times else "never"
-            oldest = times[-1] if times else "never"
-            all_latest = price_db.get_all_latest()
-            result = {
-                "total_snapshots": snap_count,
-                "latest_fetch": latest,
-                "oldest_fetch": oldest,
-                "items_tracked": len(all_latest),
-            }
-            return [TextContent(type="text", text=json.dumps(result, indent=2))]
-
-        else:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
-
-    except Exception as e:
-        return [TextContent(type="text", text=f"Error: {type(e).__name__}: {e}")]
-
-
-from mcp_server_utils import run_server
 
 if __name__ == "__main__":
-    run_server(app, port=8481, name="poe-market")
+    run_server(app)

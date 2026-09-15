@@ -3,3 +3,8 @@ __pycache__/
 *.pyo
 .env
 config.json
+.test-venv/
+.pytest_cache/
+.cache/
+*.sqlite3
+*.sqlite3-*
