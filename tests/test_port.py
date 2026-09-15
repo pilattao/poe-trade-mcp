@@ -91,7 +91,8 @@ def test_trade_search_has_poe2_realm_and_no_credentials(monkeypatch):
     monkeypatch.setattr(
         poe_trade,
         "_post_json",
-        lambda url, payload: seen.append(url) or {"id": "abc123", "total": 2},
+        lambda url, payload: seen.append(url)
+        or {"id": "abc123", "total": 2, "result": ["listing-a", "listing-b"]},
     )
     monkeypatch.setattr(poe_trade, "_validate_search_metadata", lambda args: None)
     result = run(poe_trade.call_tool("search_trade", {"league": "Test / HC"}))

@@ -193,8 +193,10 @@ profile-fetch cooldown limits uncached requests. No private data is published.
   surfaced; there is no hidden fallback to private APIs.
 - There is no historical backfill, background polling, appraisal of exact rolls,
   automatic purchase, or headless PoB engine in this submodule.
-- Filter tools edit only local files; they do not publish filters or validate
-  all game-version syntax. Existing filter parser behavior is otherwise retained.
+- Filter tools discover native PoE2 bases, edit local rules, generate filters from
+  public reference prices, and check syntax and symbolic item matching. They do
+  not publish or activate filters, and are not the game-client compiler. See
+  [FILTERS.md](FILTERS.md) for all filter workflows and source limitations.
 
 ## Verification
 

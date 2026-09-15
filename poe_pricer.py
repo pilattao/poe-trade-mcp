@@ -315,7 +315,15 @@ def _parse_clipboard(text):
             }.get(rarity)
             if frame is None:
                 raise ValueError(f"Unsupported clipboard rarity: {rarity}")
-            return {"name": lines[index + 1], "frameType": frame}
+            item = {"name": lines[index + 1], "frameType": frame}
+            if frame == 3:
+                # Clipboard input must select the same base/corruption variant
+                # as API-shaped input, never an uncorrupted price for a
+                # corrupted item merely because its unique name matches.
+                if index + 2 < len(lines) and not lines[index + 2].startswith("---"):
+                    item["baseType"] = lines[index + 2]
+                item["corrupted"] = "Corrupted" in lines
+            return item
     raise ValueError("Expected English PoE clipboard text with Rarity and item name")
 
 

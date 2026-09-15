@@ -14,9 +14,10 @@ Read [README.md](README.md) for source semantics and configuration.
 | stash | `score_rare`, `poe_auth_status` | Local PoE2 clipboard comparison analysis; OAuth status inspects only an explicitly configured owned store, returning metadata. |
 | stash | `poe_auth` | Default local status; explicit `action=authorize` requires enablement and confirmation before PKCE/loopback authorization. |
 | stash | `get_tab`, `list_tabs`, `price_tab`, `find_items`, `cache_status` | Explicit not-implemented errors; preserved source and exact API gaps in PORT_REPORT.md. |
-| filter | `get_filter_info`, `find_blocks`, `get_block`, `add_block`, `remove_block`, `replace_block`, `set_basetype_rule` | Existing local file operations with PoE2 default directory and protocol error status. |
+| filter | `get_filter_info`, `find_blocks`, `get_block`, `add_block`, `remove_block`, `replace_block`, `set_basetype_rule`, `reload_filter` | Local PoE2 file operations; correct Continue/import boundaries, exact managed overrides and preserved encoding. |
+| filter | `get_filter_catalog`, `validate_filter`, `test_filter`, `create_filter`, `generate_economy_filter` | Native PoE2 class/base discovery, syntax and symbolic previews, explicit-path artifacts, and public reference-price snapshots. See [FILTERS.md](FILTERS.md). |
 
-**40 tools total: 33 implemented, 7 explicit compatibility errors.**
+**46 tools total: 39 implemented, 7 explicit compatibility errors.**
 
 ## Economy categories
 

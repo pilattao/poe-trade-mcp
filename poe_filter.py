@@ -1,536 +1,265 @@
-"""PoE Filter MCP Server — read and edit .filter files programmatically.
+"""Read, validate, preview and generate PoE2 loot filters, without game writes.
 
-Supports the full PoE item filter syntax (Show/Hide/Continue blocks, all conditions
-and actions). Designed for NeverSink-style filters with comment metadata.
-
-Tools:
-  get_filter_info     — summary of filter (path, size, block count, section headers)
-  find_blocks         — search blocks by text, class, basetype, or comment
-  get_block           — get a specific block by line number
-  add_block           — insert a new block at a position (top/bottom/after pattern)
-  remove_block        — remove a block by line number or anchor comment
-  replace_block       — replace a block entirely
-  set_basetype_rule   — convenience: show/hide a specific BaseType everywhere
-  reload_filter       — reload filter from disk (discards unsaved changes)
-
-Version: 1.0
+Authoritative syntax: https://www.pathofexile.com/item-filter/about
+Native base names are read from an explicitly selected PoB2 installation.
 """
+from __future__ import annotations
+import hashlib
 import json
+import os
 import re
-import sys
+import tempfile
 from pathlib import Path
 
-from mcp_server_utils import Server
-from mcp.types import TextContent, Tool
+import anyio
+from mcp.types import Tool
+from mcp_server_utils import Server, result, run_server
+from filter_catalog import CLASSES, CLASS_MAP, SOURCES, load_catalog, local_path
+from filter_model import (header, tokens, parse_blocks, find_block_bounds, validate, preview, quoted, operand)
+import filter_economy
 
-# Default filter path — configure via POE_FILTER_PATH env var.
-# Fallback guesses the standard PoE documents location on Windows/macOS/Linux.
-import os as _os
-DEFAULT_FILTER = Path(
-    _os.environ.get("POE_FILTER_PATH") or
-    str(Path.home() / "Documents" / "My Games" / "Path of Exile 2" / "Starting.filter")
-)
-
-app = Server("poe-filter")
-print("[poe-filter] SERVER START v1.0", file=sys.stderr)
+DEFAULT_FILTER = Path.home() / 'Documents/My Games/Path of Exile 2/Starting.filter'
+app = Server('poe-filter')
 
 
-# ── Filter parsing ─────────────────────────────────────────────────────────────
-
-def _load_filter(path: Path) -> list[str]:
-    """Load filter as list of lines (preserving line endings stripped)."""
-    return path.read_text(encoding="utf-8", errors="replace").splitlines()
-
-
-def _find_block_bounds(lines: list[str], start: int) -> tuple[int, int]:
-    """Return (start, end) line indices (inclusive) for block starting at `start`."""
-    end = start
-    for i in range(start + 1, len(lines)):
-        stripped = lines[i].strip()
-        if stripped.startswith(("Show", "Hide", "Continue")):
-            # Next block starts here — previous line is our end
-            end = i - 1
-            break
-    else:
-        end = len(lines) - 1
-    # Trim trailing blank lines from block
-    while end > start and not lines[end].strip():
-        end -= 1
-    return start, end
+def _get_filter_path(arguments, *, output=False):
+    value = arguments.get('output_path' if output else 'filter_path')
+    if value is None and not output: value = os.environ.get('POE_FILTER_PATH') or DEFAULT_FILTER
+    if value is None: raise ValueError('An explicit output_path is required; no active filter is chosen')
+    if os.name != 'nt' and re.match(r'^[A-Za-z]:[\\/]', str(value)) and not (Path('/mnt') / str(value)[0].lower()).is_dir():
+        raise ValueError('Windows paths need their mounted WSL drive; otherwise provide a native absolute path')
+    path = local_path(value)
+    if not path.is_absolute(): raise ValueError('Supply an absolute local filter path')
+    if path.suffix.lower() != '.filter': raise ValueError('Filter files must have the .filter extension')
+    if path.is_symlink(): raise ValueError('Use the actual filter path, not a symlink')
+    return path.resolve()
 
 
-def _parse_blocks(lines: list[str]) -> list[dict]:
-    """Parse all blocks from lines, return list of block dicts."""
-    blocks = []
-    i = 0
-    while i < len(lines):
-        stripped = lines[i].strip()
-        if stripped.startswith(("Show", "Hide", "Continue")):
-            start, end = _find_block_bounds(lines, i)
-            block_lines = lines[start:end + 1]
-            # Extract comment from header line
-            header = stripped
-            comment = ""
-            if "#" in header:
-                comment = header[header.index("#"):].strip()
-            btype = header.split()[0]
-            blocks.append({
-                "line": start,
-                "end_line": end,
-                "type": btype,
-                "comment": comment,
-                "header": header,
-                "body": "\n".join(block_lines),
-                "conditions": _extract_conditions(block_lines[1:]),
-            })
-            i = end + 1
-        else:
-            i += 1
-    return blocks
+def _load_filter(path):
+    if path.stat().st_size > 8_000_000: raise ValueError('Filter exceeds the 8 MB analysis bound')
+    return path.read_text(encoding='utf-8-sig').splitlines()
 
 
-def _extract_conditions(lines: list[str]) -> dict:
-    """Extract key conditions from block body lines."""
-    conds = {}
-    for line in lines:
-        s = line.strip()
-        if not s or s.startswith("#"):
-            continue
-        parts = s.split(None, 1)
-        if not parts:
-            continue
-        key = parts[0]
-        val = parts[1] if len(parts) > 1 else ""
-        conds[key] = val
-    return conds
+def _write_filter(path, lines, *, create=False, overwrite=False):
+    previous = path.read_bytes() if path.is_file() else b''
+    if create and path.exists() and not overwrite: raise FileExistsError('Output already exists; no existing filter was replaced')
+    ending = '\r\n' if b'\r\n' in previous else '\n'
+    text = ending.join('\n'.join(lines).splitlines()).rstrip('\r\n') + ending
+    encoded = (b'\xef\xbb\xbf' if previous.startswith(b'\xef\xbb\xbf') else b'') + text.encode('utf-8')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.poe2-filter-', delete=False) as stream:
+            temporary = Path(stream.name); stream.write(encoded); stream.flush(); os.fsync(stream.fileno())
+        if create and not overwrite:
+            os.link(temporary, path)  # Exclusive creation: another writer cannot be overwritten.
+        else: os.replace(temporary, path)
+    finally:
+        if temporary is not None: temporary.unlink(missing_ok=True)
+    return {'path': str(path), 'bytes': len(encoded), 'sha256': hashlib.sha256(encoded).hexdigest()}
 
 
-def _get_filter_path(arguments: dict) -> Path:
-    p = arguments.get("filter_path")
-    return Path(p) if p else DEFAULT_FILTER
+_parse_blocks = parse_blocks
+_find_block_bounds = find_block_bounds
 
 
-# ── Tool definitions ────────────────────────────────────────────────────────────
-
-TOOLS = [
-    Tool(
-        name="get_filter_info",
-        description=(
-            "Get summary info about the filter: path, total lines, block count, "
-            "and all section headers (## comments). Use this to orient yourself "
-            "before making changes."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "filter_path": {
-                    "type": "string",
-                    "description": f"Path to .filter file. Default: {DEFAULT_FILTER}",
-                },
-            },
-        },
-    ),
-    Tool(
-        name="find_blocks",
-        description=(
-            "Search filter blocks matching a query. Returns matching blocks with "
-            "line numbers, type (Show/Hide/Continue), comment, and key conditions. "
-            "Query is matched against the full block text (case-insensitive)."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Text to search for (e.g. 'Orb of Chance', 'Body Armours', 'Bosch').",
-                },
-                "filter_path": {"type": "string"},
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results to return (default 20).",
-                },
-            },
-            "required": ["query"],
-        },
-    ),
-    Tool(
-        name="get_block",
-        description="Get the full text of a block by its starting line number.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "line": {
-                    "type": "integer",
-                    "description": "Starting line number of the block (1-based).",
-                },
-                "filter_path": {"type": "string"},
-            },
-            "required": ["line"],
-        },
-    ),
-    Tool(
-        name="add_block",
-        description=(
-            "Insert a new filter block. Positions:\n"
-            "  'top' — after the [[0100]] override header (highest priority)\n"
-            "  'bottom' — at the end of the file\n"
-            "  'after_line:N' — after line number N\n"
-            "  'after_pattern:TEXT' — after the first line containing TEXT"
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "block_text": {
-                    "type": "string",
-                    "description": "Full block text to insert, e.g. 'Hide\\n\\tBaseType == \"Orb of Chance\"'",
-                },
-                "position": {
-                    "type": "string",
-                    "description": "Where to insert. Default: 'top'",
-                },
-                "filter_path": {"type": "string"},
-            },
-            "required": ["block_text"],
-        },
-    ),
-    Tool(
-        name="remove_block",
-        description=(
-            "Remove a block by its starting line number. "
-            "Use find_blocks first to locate the line number."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "line": {
-                    "type": "integer",
-                    "description": "Starting line number of the block to remove (1-based).",
-                },
-                "filter_path": {"type": "string"},
-            },
-            "required": ["line"],
-        },
-    ),
-    Tool(
-        name="replace_block",
-        description=(
-            "Replace a block entirely with new text. "
-            "Use find_blocks first to locate the line number."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "line": {
-                    "type": "integer",
-                    "description": "Starting line number of the block to replace (1-based).",
-                },
-                "new_block_text": {
-                    "type": "string",
-                    "description": "Replacement block text.",
-                },
-                "filter_path": {"type": "string"},
-            },
-            "required": ["line", "new_block_text"],
-        },
-    ),
-    Tool(
-        name="set_basetype_rule",
-        description=(
-            "Convenience tool: add a top-priority Show or Hide rule for one or more "
-            "BaseTypes. Inserts into the [[0100]] override section. "
-            "If a Bosch override already exists for the same basetype, it is replaced."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "description": "'Show' or 'Hide'",
-                },
-                "basetypes": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of BaseType strings, e.g. ['Orb of Chance', 'Orb of Alteration']",
-                },
-                "exact_match": {
-                    "type": "boolean",
-                    "description": "Use == (exact match) instead of substring. Default true.",
-                },
-                "comment": {
-                    "type": "string",
-                    "description": "Optional comment to add to the block header.",
-                },
-                "extra_conditions": {
-                    "type": "string",
-                    "description": "Optional extra condition lines, e.g. 'StackSize >= 3'",
-                },
-                "filter_path": {"type": "string"},
-            },
-            "required": ["action", "basetypes"],
-        },
-    ),
-]
+def _extract_conditions(lines):
+    return {p[0]: ' '.join(p[1:]) for line in lines if (p := tokens(line))}
 
 
-# ── Tool implementation ─────────────────────────────────────────────────────────
-
-def _tool_get_filter_info(arguments: dict) -> str:
-    path = _get_filter_path(arguments)
-    lines = _load_filter(path)
-    blocks = _parse_blocks(lines)
-
-    # Find section headers
-    sections = []
-    for i, line in enumerate(lines):
-        s = line.strip()
-        if re.match(r"#\s*\[\[", s):
-            sections.append(f"L{i+1}: {s}")
-
-    show_count = sum(1 for b in blocks if b["type"] == "Show")
-    hide_count = sum(1 for b in blocks if b["type"] == "Hide")
-    cont_count = sum(1 for b in blocks if b["type"] == "Continue")
-
-    result = {
-        "path": str(path),
-        "total_lines": len(lines),
-        "blocks": {"Show": show_count, "Hide": hide_count, "Continue": cont_count, "total": len(blocks)},
-        "sections": sections[:40],  # first 40 section headers
-    }
-    return json.dumps(result, indent=2)
-
-
-def _tool_find_blocks(arguments: dict) -> str:
-    path = _get_filter_path(arguments)
-    query = arguments["query"].lower()
-    limit = arguments.get("limit", 20)
-    lines = _load_filter(path)
-    blocks = _parse_blocks(lines)
-
-    matches = []
-    for b in blocks:
-        if query in b["body"].lower():
-            matches.append({
-                "line": b["line"] + 1,  # 1-based for user
-                "end_line": b["end_line"] + 1,
-                "type": b["type"],
-                "comment": b["comment"],
-                "conditions": b["conditions"],
-                "preview": b["body"][:300],
-            })
-        if len(matches) >= limit:
-            break
-
-    return json.dumps({"total_matches": len(matches), "blocks": matches}, indent=2)
-
-
-def _tool_get_block(arguments: dict) -> str:
-    path = _get_filter_path(arguments)
-    line_1based = arguments["line"]
-    lines = _load_filter(path)
-    idx = line_1based - 1
-    if idx < 0 or idx >= len(lines):
-        return json.dumps({"error": f"Line {line_1based} out of range (file has {len(lines)} lines)"})
-    stripped = lines[idx].strip()
-    if not stripped.startswith(("Show", "Hide", "Continue")):
-        return json.dumps({"error": f"Line {line_1based} is not a block header: {lines[idx]!r}"})
-    start, end = _find_block_bounds(lines, idx)
-    return json.dumps({
-        "line": start + 1,
-        "end_line": end + 1,
-        "text": "\n".join(lines[start:end + 1]),
-    }, indent=2)
-
-
-def _validate_block(block_text: str) -> str | None:
-    """Validate a filter block has proper structure. Returns error string or None."""
-    block_lines = block_text.strip().splitlines()
-    if not block_lines:
-        return "Block text is empty"
-    header = block_lines[0].strip()
-    if not header.startswith(("Show", "Hide", "Continue")):
-        return f"Block must start with Show/Hide/Continue, got: {header!r}"
-    # Check for escaped newlines/tabs that should be real whitespace
-    if r"\n" in block_text or r"\t" in block_text:
-        return (
-            r"Block contains literal \n or \t sequences — these must be actual "
-            "newline/tab characters, not escaped strings. The block would be written "
-            "as a single line and match ALL items with no conditions."
-        )
-    # Must have at least one condition line (indented) after the header
-    condition_lines = [l for l in block_lines[1:] if l.strip() and not l.strip().startswith("#")]
-    if not condition_lines:
-        return "Block has no conditions — would match ALL items. Add at least one condition."
+def _validate_block(block_text):
+    checked = validate(block_text)
+    if not checked['valid']: return str(checked['errors'])
+    if len(parse_blocks(block_text.splitlines())) != 1 or checked['imports']:
+        return 'Provide exactly one Show/Hide block; Continue is an action within it'
     return None
 
 
-def _tool_add_block(arguments: dict) -> str:
-    path = _get_filter_path(arguments)
-    block_text = arguments["block_text"].rstrip()
-    position = arguments.get("position", "top")
-
-    err = _validate_block(block_text)
-    if err:
-        return json.dumps({"error": f"Invalid block: {err}", "block_text": block_text})
-
-    lines = _load_filter(path)
-
-    insert_after = None  # 0-based index of line AFTER which to insert
-
-    if position == "top":
-        # Find end of [[0100]] header comment + any existing Bosch overrides
-        for i, line in enumerate(lines):
-            if re.search(r"#.*\[\[0100\]\]", line) or re.search(r"Waypoint c0\.alpha", line):
-                insert_after = i
-        if insert_after is None:
-            insert_after = 0
-        # Advance past any existing content in the section (up to next [[xxxx]] section)
-        for i in range(insert_after, len(lines)):
-            if i > insert_after and re.match(r"#\s*={10}", lines[i]):
-                insert_after = i - 1
-                break
-            insert_after = i
-            if re.match(r"#\s*={10}", lines[i]) and i > 0 and re.search(r"\[\[0[2-9]", lines[i]):
-                insert_after = i - 1
-                break
-
-    elif position == "bottom":
-        insert_after = len(lines) - 1
-
-    elif position.startswith("after_line:"):
-        insert_after = int(position.split(":")[1]) - 1  # convert to 0-based
-
-    elif position.startswith("after_pattern:"):
-        pattern = position[len("after_pattern:"):].lower()
-        for i, line in enumerate(lines):
-            if pattern in line.lower():
-                insert_after = i
-                break
-        if insert_after is None:
-            return json.dumps({"error": f"Pattern not found: {pattern}"})
-
-    else:
-        return json.dumps({"error": f"Unknown position: {position}"})
-
-    new_lines = ["", block_text, ""]
-    lines = lines[:insert_after + 1] + new_lines + lines[insert_after + 1:]
-    path.write_text("\n".join(lines), encoding="utf-8")
-    print(f"[poe-filter] add_block at line {insert_after+1}, position={position}", file=sys.stderr)
-    return json.dumps({"ok": True, "inserted_after_line": insert_after + 1, "new_block": block_text})
+def _tool_get_filter_info(arguments):
+    path = _get_filter_path(arguments); lines = _load_filter(path); blocks = parse_blocks(lines)
+    return json.dumps({'path': str(path), 'game': 'poe2', 'total_lines': len(lines),
+        'blocks': {**{k: sum(b['type'] == k for b in blocks) for k in ('Show', 'Hide', 'Minimal')}, 'total': len(blocks)},
+        'continue_actions': sum('Continue' in b['conditions'] for b in blocks),
+        'sections': [f'L{i + 1}: {line.strip()}' for i, line in enumerate(lines) if re.match(r'#\s*(?:\[\[|##)', line.strip())][:100]})
 
 
-def _tool_remove_block(arguments: dict) -> str:
-    path = _get_filter_path(arguments)
-    line_1based = arguments["line"]
-    lines = _load_filter(path)
-    idx = line_1based - 1
-    if idx < 0 or idx >= len(lines):
-        return json.dumps({"error": f"Line {line_1based} out of range"})
-    stripped = lines[idx].strip()
-    if not stripped.startswith(("Show", "Hide", "Continue")):
-        return json.dumps({"error": f"Line {line_1based} is not a block header: {lines[idx]!r}"})
-    start, end = _find_block_bounds(lines, idx)
-    # Also remove surrounding blank lines
-    while start > 0 and not lines[start - 1].strip():
-        start -= 1
-    removed = "\n".join(lines[start:end + 1])
-    lines = lines[:start] + lines[end + 1:]
-    path.write_text("\n".join(lines), encoding="utf-8")
-    print(f"[poe-filter] remove_block lines {start+1}-{end+1}", file=sys.stderr)
-    return json.dumps({"ok": True, "removed_lines": f"{start+1}-{end+1}", "removed_text": removed})
+def _tool_find_blocks(arguments):
+    path = _get_filter_path(arguments); query = arguments['query'].casefold(); limit = arguments.get('limit', 20)
+    matches = [b for b in parse_blocks(_load_filter(path)) if query in b['body'].casefold()]
+    return json.dumps({'total_matches': len(matches), 'blocks': [{'line': b['line'] + 1, 'end_line': b['end_line'] + 1,
+        'type': b['type'], 'comment': b['comment'], 'conditions': b['conditions'], 'preview': b['body'][:500]} for b in matches[:limit]]})
 
 
-def _tool_replace_block(arguments: dict) -> str:
-    path = _get_filter_path(arguments)
-    line_1based = arguments["line"]
-    new_text = arguments["new_block_text"].rstrip()
-
-    err = _validate_block(new_text)
-    if err:
-        return json.dumps({"error": f"Invalid block: {err}", "block_text": new_text})
-
-    lines = _load_filter(path)
-    idx = line_1based - 1
-    if idx < 0 or idx >= len(lines):
-        return json.dumps({"error": f"Line {line_1based} out of range"})
-    stripped = lines[idx].strip()
-    if not stripped.startswith(("Show", "Hide", "Continue")):
-        return json.dumps({"error": f"Line {line_1based} is not a block header"})
-    start, end = _find_block_bounds(lines, idx)
-    old_text = "\n".join(lines[start:end + 1])
-    new_block_lines = new_text.splitlines()
-    lines = lines[:start] + new_block_lines + lines[end + 1:]
-    path.write_text("\n".join(lines), encoding="utf-8")
-    return json.dumps({"ok": True, "replaced_lines": f"{start+1}-{end+1}", "old": old_text, "new": new_text})
+def _block_at(lines, line):
+    if isinstance(line, bool) or not isinstance(line, int) or not 1 <= line <= len(lines): raise ValueError('Block line is out of range')
+    if not header(lines[line - 1]): raise ValueError('Line is not a Show/Hide block header')
+    return find_block_bounds(lines, line - 1)
 
 
-def _tool_set_basetype_rule(arguments: dict) -> str:
-    path = _get_filter_path(arguments)
-    action = arguments["action"].capitalize()
-    if action not in ("Show", "Hide"):
-        return json.dumps({"error": "action must be 'Show' or 'Hide'"})
-    basetypes = arguments["basetypes"]
-    exact = arguments.get("exact_match", True)
-    comment = arguments.get("comment", f"Bosch: {action} {', '.join(basetypes)}")
-    extra = arguments.get("extra_conditions", "").strip()
-
-    op = "==" if exact else ""
-    bt_str = " ".join(f'"{b}"' for b in basetypes)
-    lines_out = [f"{action} # {comment}"]
-    if extra:
-        for line in extra.splitlines():
-            lines_out.append(f"\t{line.strip()}")
-    lines_out.append(f"\tBaseType {op} {bt_str}" if op else f"\tBaseType {bt_str}")
-    block_text = "\n".join(lines_out)
-
-    # Check if a Bosch override for the same basetypes already exists — if so, replace it
-    filter_lines = _load_filter(path)
-    blocks = _parse_blocks(filter_lines)
-    for b in blocks:
-        if comment.lower() in b["body"].lower() or any(bt.lower() in b["body"].lower() for bt in basetypes):
-            if "Bosch" in b["comment"]:
-                # Replace it
-                return _tool_replace_block({"line": b["line"] + 1, "new_block_text": block_text, "filter_path": str(path)})
-
-    # Otherwise insert at top
-    return _tool_add_block({"block_text": block_text, "position": "top", "filter_path": str(path)})
+def _tool_get_block(arguments):
+    lines = _load_filter(_get_filter_path(arguments)); start, end = _block_at(lines, arguments['line'])
+    return json.dumps({'line': start + 1, 'end_line': end + 1, 'text': '\n'.join(lines[start:end + 1])})
 
 
-# ── MCP server ──────────────────────────────────────────────────────────────────
+def _tool_add_block(arguments):
+    path = _get_filter_path(arguments); text = arguments['block_text'].strip(); position = arguments.get('position', 'top')
+    error = _validate_block(text)
+    if error: return json.dumps({'error': f'Invalid block: {error}'})
+    lines = _load_filter(path); blocks = parse_blocks(lines)
+    if position == 'top':
+        index = next((i for i, line in enumerate(lines) if tokens(line)), len(lines))
+    elif position == 'bottom': index = len(lines)
+    elif position.startswith('after_line:'):
+        index = int(position.split(':', 1)[1])
+        if not 0 <= index <= len(lines): raise ValueError('Insertion line is out of range')
+        if any(b['line'] < index <= b['end_line'] for b in blocks): raise ValueError('Insertion would split an existing block; use its final line')
+    elif position.startswith('after_pattern:'):
+        pattern = position.split(':', 1)[1].casefold()
+        found = next((i for i, line in enumerate(lines) if pattern in line.casefold()), None)
+        if found is None: raise ValueError('Insertion pattern not found')
+        block = next((b for b in blocks if b['line'] <= found <= b['end_line']), None)
+        index = block['end_line'] + 1 if block else found + 1
+    else: raise ValueError('Unknown insertion position')
+    _write_filter(path, lines[:index] + text.splitlines() + [''] + lines[index:])
+    return json.dumps({'ok': True, 'inserted_after_line': index, 'new_block': text, 'path': str(path)})
+
+
+def _tool_remove_block(arguments):
+    path = _get_filter_path(arguments); lines = _load_filter(path); start, end = _block_at(lines, arguments['line'])
+    removed = '\n'.join(lines[start:end + 1]); _write_filter(path, lines[:start] + lines[end + 1:])
+    return json.dumps({'ok': True, 'removed_lines': f'{start + 1}-{end + 1}', 'removed_text': removed})
+
+
+def _tool_replace_block(arguments):
+    path = _get_filter_path(arguments); lines = _load_filter(path); start, end = _block_at(lines, arguments['line'])
+    text = arguments['new_block_text'].strip(); error = _validate_block(text)
+    if error: return json.dumps({'error': f'Invalid block: {error}'})
+    old = '\n'.join(lines[start:end + 1]); _write_filter(path, lines[:start] + text.splitlines() + lines[end + 1:])
+    return json.dumps({'ok': True, 'replaced_lines': f'{start + 1}-{end + 1}', 'old': old, 'new': text})
+
+
+def _tool_set_basetype_rule(arguments):
+    path = _get_filter_path(arguments); action = arguments['action']; bases = arguments['basetypes']; exact = arguments.get('exact_match', True)
+    if action not in ('Show', 'Hide'): raise ValueError('action must be Show or Hide')
+    if not bases or len(set(bases)) != len(bases): raise ValueError('Provide distinct nonempty base names')
+    names = ' '.join(quoted(b) for b in bases)
+    comment = arguments.get('comment', '')
+    if '\n' in comment or '\r' in comment: raise ValueError('Comment must occupy one line')
+    extra = arguments.get('extra_conditions', '').strip()
+    marker = hashlib.sha256(json.dumps([sorted(bases), exact, extra]).encode()).hexdigest()[:12]
+    text = f'{action} # poe2-mcp:basetype:{marker}' + (f' {comment}' if comment else '')
+    text += '\n    BaseType ' + ('== ' if exact else '') + names
+    if extra: text += '\n' + '\n'.join('    ' + line.strip() for line in extra.splitlines())
+    error = _validate_block(text)
+    if error: raise ValueError(error)
+    for block in parse_blocks(_load_filter(path)):
+        if not block['comment'].startswith(('poe2-mcp:', 'Bosch:')): continue
+        base_directives = [tokens(line) for line in block['body'].splitlines()[1:] if tokens(line) and tokens(line)[0] == 'BaseType']
+        if len(base_directives) != 1: continue
+        op, values = operand(base_directives[0][1:])
+        if set(values) == set(bases) and (op == '==') == exact and (marker in block['comment'] or not extra and block['comment'].startswith('Bosch:')):
+            return _tool_replace_block({'filter_path': str(path), 'line': block['line'] + 1, 'new_block_text': text})
+    return _tool_add_block({'filter_path': str(path), 'block_text': text, 'position': 'top'})
+
+
+def _catalog(arguments):
+    return load_catalog(arguments.get('pob_directory'), include_hidden=arguments.get('include_hidden', False))
+
+
+def _text(arguments):
+    return arguments['text'] if 'text' in arguments else '\n'.join(_load_filter(_get_filter_path(arguments)))
+
+
+def _create(arguments, *, blocks=None, economy=None):
+    path = _get_filter_path(arguments, output=True)
+    blocks = arguments['blocks'] if blocks is None else blocks
+    if not isinstance(blocks, list) or any(not isinstance(b, str) for b in blocks): raise ValueError('blocks must be filter text sections')
+    heading = '# PoE2 filter generated by poe-mcp-suite\n# Syntax: ' + SOURCES[0]
+    if economy:
+        heading += '\n# Economy: ' + economy['league'] + '; reference unit ' + economy['currency'] + '; snapshot ' + economy['created_at']
+        for source in economy['sources']:
+            heading += '\n# Price source: ' + source.get('source_url', 'unknown') + '; fetched ' + source.get('fetched_at', 'unknown')
+    text = heading + '\n\n' + '\n\n'.join(block.strip() for block in blocks) + '\n\nShow\n'
+    catalog = _catalog(arguments) if arguments.get('pob_directory') else None
+    checked = validate(text, catalog=catalog, path=path, strict_native_names=True)
+    if not checked['valid']: raise ValueError(f'Filter validation failed: {checked["errors"]}')
+    output = _write_filter(path, text.splitlines(), create=True, overwrite=arguments.get('overwrite', False))
+    return {'ok': True, **output, 'validation': checked, 'economy': economy, 'activation': 'File only; no active filter was selected or reloaded'}
+
+
+def _dispatch(name, arguments):
+    old = {'get_filter_info': _tool_get_filter_info, 'find_blocks': _tool_find_blocks, 'get_block': _tool_get_block,
+        'add_block': _tool_add_block, 'remove_block': _tool_remove_block, 'replace_block': _tool_replace_block, 'set_basetype_rule': _tool_set_basetype_rule}
+    if name in old: return json.loads(old[name](arguments))
+    if name == 'reload_filter': return {'reloaded_from_disk': True, **json.loads(_tool_get_filter_info(arguments))}
+    if name == 'get_filter_catalog':
+        data = _catalog(arguments) if arguments.get('include_bases', True) else {
+            'classes': CLASSES, 'bases': [], 'source': {'game': 'poe2', 'kind': 'documented class mappings', 'filter_references': SOURCES},
+            'notes': ['Native bases were not requested; enable include_bases and provide a PoB2 directory to discover them.']}
+        query = arguments.get('query', '').casefold(); requested = arguments.get('item_class')
+        item_class = CLASS_MAP.get(requested, requested)
+        if item_class is not None and item_class not in CLASSES: raise ValueError('Unknown PoE2 item class')
+        rows = [row for row in data['bases'] if query in row['name'].casefold() and (item_class is None or row['item_class'] == item_class)]
+        return {**data, 'bases': rows[:arguments.get('limit', 50)], 'matched_bases': len(rows), 'total_bases': len(data['bases']),
+            'base_catalog_loaded': arguments.get('include_bases', True)}
+    if name == 'validate_filter': return validate(_text(arguments), catalog=_catalog(arguments) if arguments.get('pob_directory') else None,
+        path=_get_filter_path(arguments) if arguments.get('filter_path') else None)
+    if name == 'test_filter': return preview(_text(arguments), arguments['items'])
+    if name == 'create_filter': return _create(arguments)
+    if name == 'generate_economy_filter':
+        league = arguments['league']; categories = arguments.get('categories', ['Currency'])
+        rows = filter_economy.fetch_filter_prices(league, categories)
+        blocks, economy = filter_economy.economy_blocks(rows, league=league, currency=arguments.get('currency', 'exalted'),
+            min_value=arguments.get('min_value', 1), high_value=arguments.get('high_value', 10), hide_below=arguments.get('hide_below', False))
+        # Caller rules go first; price-derived highlights cannot override explicit choices.
+        return _create(arguments, blocks=arguments.get('blocks', []) + blocks, economy=economy)
+    raise ValueError(f'Unknown filter tool: {name}')
+
+
+PATH = {'filter_path': {'type': 'string', 'description': 'Absolute local .filter path; POE_FILTER_PATH may configure the default'}}
+NATIVE = {'pob_directory': {'type': 'string', 'description': 'Verified local PoB2 install or source directory; read only'}}
+OUTPUT = {'output_path': {'type': 'string', 'description': 'Explicit absolute .filter output path; never activates it'},
+          'overwrite': {'type': 'boolean', 'default': False}, **NATIVE}
+TEXT = {**PATH, 'text': {'type': 'string'}}
+
+def _tool(name, description, properties, required=(), **extra):
+    return Tool(name=name, description=description, inputSchema={'type': 'object', 'properties': properties,
+        'required': list(required), 'additionalProperties': False, **extra})
+
+
+TOOLS = [
+    _tool('get_filter_info', 'Read local filter structure and section headers. Continue is an action, not a block.', PATH),
+    _tool('find_blocks', 'Find local filter blocks by text; returns 1-based line numbers and a bounded preview.', {**PATH, 'query': {'type': 'string'}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 200}}, ['query']),
+    _tool('get_block', 'Read a block at its 1-based starting line.', {**PATH, 'line': {'type': 'integer', 'minimum': 1}}, ['line']),
+    _tool('add_block', 'Insert one validated PoE2 block. top precedes all rules/imports; after_pattern appends after its matching block.', {**PATH, 'block_text': {'type': 'string'}, 'position': {'type': 'string'}}, ['block_text']),
+    _tool('remove_block', 'Remove one block, preserving adjoining section comments.', {**PATH, 'line': {'type': 'integer', 'minimum': 1}}, ['line']),
+    _tool('replace_block', 'Replace one block; preserves UTF-8 BOM and newline convention.', {**PATH, 'line': {'type': 'integer', 'minimum': 1}, 'new_block_text': {'type': 'string'}}, ['line', 'new_block_text']),
+    _tool('set_basetype_rule', 'Create a highest-priority exact base rule; only an equivalent managed rule is replaced.', {**PATH,
+        'action': {'enum': ['Show', 'Hide']}, 'basetypes': {'type': 'array', 'minItems': 1, 'maxItems': 200, 'uniqueItems': True, 'items': {'type': 'string', 'minLength': 1}},
+        'exact_match': {'type': 'boolean'}, 'comment': {'type': 'string'}, 'extra_conditions': {'type': 'string'}}, ['action', 'basetypes']),
+    _tool('reload_filter', 'Re-read the local file; does not reload or alter the game client.', PATH),
+    _tool('get_filter_catalog', 'Discover real PoE2 filter classes and local native base definitions. No PoE1 crafting-base fallback or drop/value assumptions.', {**NATIVE,
+        'query': {'type': 'string'}, 'item_class': {'type': 'string'}, 'include_bases': {'type': 'boolean', 'default': True},
+        'include_hidden': {'type': 'boolean', 'default': False}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 500}}),
+    _tool('validate_filter', 'Check PoE2 syntax and optional native equipment base identities. This is not the game-client compiler.', {**TEXT, **NATIVE}, oneOf=[{'required': ['text']}, {'required': ['filter_path']}]),
+    _tool('test_filter', 'Preview ordered rules and Continue on supplied item fields; missing fields/imports remain unknown.', {**TEXT,
+        'items': {'type': 'array', 'maxItems': 200, 'items': {'type': 'object'}}}, ['items'], oneOf=[{'required': ['text']}, {'required': ['filter_path']}]),
+    _tool('create_filter', 'Create an actual PoE2 filter from validated blocks, with a final Show for unmatched drops. Explicit output path, no overwrite by default.', {**OUTPUT,
+        'blocks': {'type': 'array', 'maxItems': 1000, 'items': {'type': 'string'}}}, ['output_path', 'blocks']),
+    _tool('generate_economy_filter', 'Generate a static PoE2 filter from public reference prices. Keeps unknown prices visible; unique bases never hide cheaper/unknown variants.', {**OUTPUT,
+        'league': {'type': 'string', 'minLength': 1}, 'categories': {'type': 'array', 'minItems': 1, 'maxItems': 5, 'uniqueItems': True, 'items': {'enum': filter_economy.CATEGORIES}},
+        'currency': {'enum': ['chaos', 'divine', 'exalted']}, 'min_value': {'type': 'number', 'exclusiveMinimum': 0}, 'high_value': {'type': 'number', 'exclusiveMinimum': 0},
+        'hide_below': {'type': 'boolean', 'default': False}, 'blocks': {'type': 'array', 'maxItems': 1000, 'items': {'type': 'string'}}}, ['output_path', 'league']),
+]
+
 
 @app.list_tools()
-async def list_tools():
-    return TOOLS
+async def list_tools(): return TOOLS
 
 
 @app.call_tool()
-async def call_tool(name: str, arguments: dict):
-    print(f"[poe-filter] {name} {json.dumps(arguments)[:120]}", file=sys.stderr)
-    try:
-        if name == "get_filter_info":
-            result = _tool_get_filter_info(arguments)
-        elif name == "find_blocks":
-            result = _tool_find_blocks(arguments)
-        elif name == "get_block":
-            result = _tool_get_block(arguments)
-        elif name == "add_block":
-            result = _tool_add_block(arguments)
-        elif name == "remove_block":
-            result = _tool_remove_block(arguments)
-        elif name == "replace_block":
-            result = _tool_replace_block(arguments)
-        elif name == "set_basetype_rule":
-            result = _tool_set_basetype_rule(arguments)
-        else:
-            result = json.dumps({"error": f"Unknown tool: {name}"})
-        return [TextContent(type="text", text=result)]
-    except Exception as e:
-        import traceback
-        msg = f"Error in {name}: {e}\n{traceback.format_exc()}"
-        print(f"[poe-filter] ERROR: {msg}", file=sys.stderr)
-        return [TextContent(type="text", text=json.dumps({"error": msg}))]
+async def call_tool(name, arguments):
+    return result(await anyio.to_thread.run_sync(lambda: _dispatch(name, arguments)))
 
 
-from mcp_server_utils import run_server
-
-if __name__ == "__main__":
-    run_server(app, port=8487, name="poe-filter")
+if __name__ == '__main__': run_server(app, port=8487, name='poe-filter')

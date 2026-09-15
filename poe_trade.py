@@ -169,18 +169,28 @@ def _search(args):
         or not isinstance(data.get("total"), int)
     ):
         raise ValueError("PoE2 trade search response lacks a valid query id/total")
+    listing_ids = data.get("result")
+    if not isinstance(listing_ids, list) or any(
+        not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", value)
+        for value in listing_ids
+    ):
+        raise ValueError("PoE2 trade search response lacks valid listing IDs")
     return {
         "game": "poe2",
         "league": league,
         "total": data["total"],
         "query_id": query_id,
+        "listing_ids": listing_ids,
         "trade_url": TRADE_SITE + encoded + "/" + query_id,
         "notice": NON_AFFILIATION_NOTICE,
     }
 
 
 def _normalize_stat(text):
-    return re.sub(r"\s+", " ", re.sub(r"\+?-?\d+(?:\.\d+)?", "#", text.lower())).strip()
+    numeric = re.sub(r"\+?-?\d+(?:\.\d+)?", "#", text.lower())
+    # Source templates use both '#' and '+#'; numeric clipboard '+5'
+    # already lost its plus sign during replacement. Normalize both equally.
+    return re.sub(r"\s+", " ", numeric.replace("+#", "#")).strip()
 
 
 def mod_text_to_stat_id(text, is_local=False):
@@ -279,7 +289,7 @@ def _tool(name, description, properties, required=()):
 TOOLS = [
     _tool(
         "search_trade",
-        "Anonymous PoE2 read-only trade search; returns a URL and count. Public API access may be denied.",
+        "Anonymous PoE2 read-only trade search; returns a URL, total count and source listing_ids for fetch_listing (batches up to 10). Returned IDs may be fewer than total matches. Public API access may be denied.",
         SEARCH,
     ),
     _tool(
